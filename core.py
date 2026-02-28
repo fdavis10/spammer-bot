@@ -14,6 +14,7 @@ BASE_DIR = _get_base_dir()
 CONFIG_PATH = BASE_DIR / "config.json"
 DATA_DIR = BASE_DIR / "data"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
+TDATA_IMPORT_DIR = DATA_DIR / "tdata_import"
 
 
 def add_file_to_storage(source_path: str) -> str:

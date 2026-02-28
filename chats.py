@@ -69,12 +69,14 @@ async def join_by_link(client: TelegramClient, link: str) -> tuple[bool, str]:
 
 
 async def join_links_from_account(
-    client: TelegramClient, phone: str, links: list[str], on_progress=None
+    client: TelegramClient, phone: str, links: list[str], on_progress=None, cancel_event=None
 ) -> dict:
     joined = 0
     failed = 0
     errors = []
     for link in links:
+        if cancel_event and cancel_event.is_set():
+            break
         success, msg = await join_by_link(client, link)
         if success:
             joined += 1
@@ -87,7 +89,7 @@ async def join_links_from_account(
     return {"joined": joined, "failed": failed, "errors": errors}
 
 
-async def run_join_all_links(links: list[str], on_progress=None) -> list[dict]:
+async def run_join_all_links(links: list[str], on_progress=None, cancel_event=None) -> list[dict]:
     cfg = load_config()
     if not cfg or not cfg.get("api_id") or not cfg.get("api_hash"):
         raise ValueError("Не настроены api_id и api_hash")
@@ -96,27 +98,32 @@ async def run_join_all_links(links: list[str], on_progress=None) -> list[dict]:
     if not accounts:
         raise ValueError("Нет авторизованных аккаунтов")
 
-    results = []
-    for acc in accounts:
+    account_stats = {}
+
+    async def join_for_account(acc: dict):
         phone = acc["phone"]
         session_path = SESSIONS_DIR / phone.replace("+", "").replace(" ", "")
         client = TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
+        account_stats[phone] = {"joined": 0, "failed": 0}
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                results.append({"phone": phone, "joined": 0, "failed": len(links), "errors": [("", "Не авторизован")]})
-                continue
+                return {"phone": phone, "joined": 0, "failed": len(links), "errors": [("", "Не авторизован")]}
+
             def acc_progress(joined, failed):
+                account_stats[phone]["joined"] = joined
+                account_stats[phone]["failed"] = failed
                 if on_progress:
-                    total_j = sum(r.get("joined", 0) for r in results) + joined
-                    total_f = sum(r.get("failed", 0) for r in results) + failed
+                    total_j = sum(s["joined"] for s in account_stats.values())
+                    total_f = sum(s["failed"] for s in account_stats.values())
                     on_progress(total_j, total_f)
 
-            r = await join_links_from_account(client, phone, links, on_progress=acc_progress)
-            results.append({"phone": phone, **r})
+            r = await join_links_from_account(client, phone, links, on_progress=acc_progress, cancel_event=cancel_event)
+            return {"phone": phone, **r}
         except Exception as e:
-            results.append({"phone": phone, "joined": 0, "failed": len(links), "errors": [("", str(e))]})
+            return {"phone": phone, "joined": 0, "failed": len(links), "errors": [("", str(e))]}
         finally:
             await client.disconnect()
-        await asyncio.sleep(2)
-    return results
+
+    results = await asyncio.gather(*[join_for_account(acc) for acc in accounts])
+    return list(results)

@@ -114,6 +114,13 @@ def cmd_run(args):
     asyncio.run(run_broadcast(cfg))
 
 
+def cmd_reset_password(args):
+    from auth import reset_password
+    if reset_password():
+        return
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -124,6 +131,7 @@ def main():
     msg_p = sub.add_parser("message")
     msg_p.add_argument("--set", action="store_true")
     sub.add_parser("run")
+    sub.add_parser("reset-password", help="Сбросить пароль доступа при утере")
 
     args = parser.parse_args()
     handlers = {
@@ -132,6 +140,7 @@ def main():
         "accounts": cmd_accounts,
         "message": cmd_message,
         "run": cmd_run,
+        "reset-password": cmd_reset_password,
     }
     handlers[args.cmd](args)
 

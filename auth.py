@@ -84,3 +84,16 @@ def require_auth() -> bool:
         return True
     print("Неверный пароль")
     return False
+
+
+def reset_password() -> bool:
+    if AUTH_FILE.exists():
+        AUTH_FILE.unlink()
+        print("Пароль сброшен.")
+    if REMEMBER_FILE.exists():
+        REMEMBER_FILE.unlink()
+        print("Помнить меня — сброшено.")
+    if not AUTH_FILE.exists():
+        print("Перезапустите приложение и задайте новый пароль (python manage.py init-auth или запуск GUI).")
+        return True
+    return False

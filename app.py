@@ -5,16 +5,17 @@ import threading
 from pathlib import Path
 from tkinter import Tk, filedialog
 
-
 import flet as ft
 
 from auth import clear_remember, is_remembered, save_remember, verify
-from broadcast import auth_account, request_code, run_broadcast, sign_in_with_code
+from broadcast import auth_account, create_client, request_code, run_broadcast, sign_in_with_code, substitute_variables
 from chats import extract_links_from_xlsx, run_join_all_links
 from core import (
     BASE_DIR,
     DATA_DIR,
+    TDATA_IMPORT_DIR,
     add_chat_links,
+    get_stats,
     add_file_to_storage,
     add_template,
     delete_template,
@@ -28,8 +29,8 @@ from core import (
     MAX_ACCOUNTS,
     SESSIONS_DIR,
 )
-from telethon import TelegramClient
-
+from tdata_import import add_accounts_to_config, import_tdata_folder, open_tdata_folder
+from validate_accounts import validate_all_accounts
 WIDTH = 1100
 HEIGHT = 700
 RESPONSE_QUEUE = queue.Queue()
@@ -70,6 +71,9 @@ def build_accounts_view(page):
         else:
             for i, acc in enumerate(cfg["accounts"]):
                 is_auth = is_account_authorized(acc["phone"])
+                is_valid = acc.get("validated", False)
+                proxy_tag = ft.Text("Прокси", size=10, color=ft.Colors.TEAL) if acc.get("proxy") else ft.Container()
+                valid_tag = ft.Text("Валидный", size=10, color=ft.Colors.GREEN) if is_valid else ft.Container()
                 accounts_list.controls.append(
                     ft.Card(
                         content=ft.Container(
@@ -79,17 +83,25 @@ def build_accounts_view(page):
                                         [
                                             ft.Icon(ft.Icons.PHONE_ANDROID, color=ft.Colors.BLUE),
                                             ft.Icon(ft.Icons.CHECK_CIRCLE, color=ft.Colors.GREEN, size=20) if is_auth else ft.Container(width=20),
+                                            ft.Icon(ft.Icons.VERIFIED_USER, color=ft.Colors.TEAL, size=18) if is_valid else ft.Container(width=18),
                                         ],
                                         spacing=4,
                                     ),
                                     ft.Column(
                                         [
                                             ft.Text(acc["phone"], weight=ft.FontWeight.W_600),
-                                            ft.Text("2FA: ***" if acc.get("password") else "2FA: —", size=12, color=ft.Colors.GREY),
+                                            ft.Row([
+                                                ft.Text("2FA: ***" if acc.get("password") else "2FA: —", size=12, color=ft.Colors.GREY),
+                                                proxy_tag,
+                                                valid_tag,
+                                            ], spacing=8),
                                         ],
                                         spacing=2,
                                     ),
-                                    ft.IconButton(icon=ft.Icons.DELETE, on_click=lambda e, idx=i: delete_account(idx)),
+                                    ft.Row([
+                                        ft.IconButton(icon=ft.Icons.EDIT, tooltip="Редактировать", on_click=lambda e, idx=i: edit_account_dialog(e, idx)),
+                                        ft.IconButton(icon=ft.Icons.DELETE, on_click=lambda e, idx=i: delete_account(idx)),
+                                    ], spacing=0),
                                 ],
                                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                             ),
@@ -106,33 +118,256 @@ def build_accounts_view(page):
             save_config(cfg)
             refresh_list()
 
-    def add_account_dialog(e):
-        p = e.page
-        phone_field = ft.TextField(label="Телефон", hint_text="+7...", width=300)
-        pwd_field = ft.TextField(label="Пароль 2FA", hint_text="пусто если нет", password=True, width=300)
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Добавить аккаунт"),
-            content=ft.Column([phone_field, pwd_field], tight=True),
-            actions=[],
-        )
-        def save_add(ev):
-            phone = phone_field.value.strip()
+    def _proxy_fields():
+        ph = ft.TextField(label="Прокси: хост", hint_text="IP или домен", width=200)
+        pp = ft.TextField(label="Порт", hint_text="1080", width=80, keyboard_type=ft.KeyboardType.NUMBER)
+        pt = ft.Dropdown(label="Тип", width=100, value="socks5", options=[ft.dropdown.Option("socks5", "SOCKS5"), ft.dropdown.Option("socks4", "SOCKS4"), ft.dropdown.Option("http", "HTTP")])
+        pu = ft.TextField(label="Логин (опц.)", width=140)
+        pw = ft.TextField(label="Пароль (опц.)", password=True, width=140)
+        return ph, pp, pt, pu, pw
+
+    def _account_dialog(p, title, on_save, initial_phone="", initial_pwd="", initial_proxy=None):
+        phone_field = ft.TextField(label="Телефон", hint_text="+7...", width=300, value=initial_phone)
+        pwd_field = ft.TextField(label="Пароль 2FA", hint_text="пусто если нет", password=True, width=300, value=initial_pwd)
+        proxy_host, proxy_port, proxy_type, proxy_user, proxy_pass = _proxy_fields()
+        if initial_proxy and isinstance(initial_proxy, dict):
+            proxy_host.value = initial_proxy.get("host", "")
+            proxy_port.value = str(initial_proxy.get("port", ""))
+            proxy_type.value = initial_proxy.get("type", "socks5")
+            proxy_user.value = initial_proxy.get("username", "")
+            proxy_pass.value = initial_proxy.get("password", "")
+        proxy_row = ft.Row([
+            ft.Text("Прокси (опционально)", size=12, color=ft.Colors.GREY),
+        ])
+        proxy_fields = ft.Column([
+            ft.Row([proxy_host, proxy_port, proxy_type]),
+            ft.Row([proxy_user, proxy_pass]),
+        ], tight=True)
+        content = ft.Column([phone_field, pwd_field, proxy_row, proxy_fields], tight=True)
+        dlg = ft.AlertDialog(modal=True, title=ft.Text(title), content=content, actions=[])
+        def save_click(ev):
+            phone = (phone_field.value or "").strip()
             if not phone:
                 return
-            cfg = load_config() or {"api_id": 0, "api_hash": "", "accounts": [], "message": ""}
-            cfg.setdefault("accounts", []).append({"phone": phone, "password": pwd_field.value or ""})
-            save_config(cfg)
+            proxy = None
+            if (proxy_host.value or "").strip():
+                try:
+                    port = int((proxy_port.value or "1080").strip()) or 1080
+                except ValueError:
+                    port = 1080
+                proxy = {
+                    "type": proxy_type.value or "socks5",
+                    "host": proxy_host.value.strip(),
+                    "port": port,
+                    "username": (proxy_user.value or "").strip() or None,
+                    "password": (proxy_pass.value or "").strip() or None,
+                }
+            on_save(ev, phone, pwd_field.value or "", proxy)
             p.pop_dialog()
             p.update()
             refresh_list()
-        def cancel_add(ev):
-            p.pop_dialog()
+        dlg.actions = [ft.TextButton("Отмена", on_click=lambda ev: (p.pop_dialog(), p.update())), ft.Button("Сохранить", on_click=save_click)]
+        p.show_dialog(dlg)
+        p.update()
+
+    def add_account_dialog(e):
+        p = e.page
+        def on_save(ev, phone, pwd, proxy):
+            cfg = load_config() or {"api_id": 0, "api_hash": "", "accounts": [], "message": ""}
+            acc = {"phone": phone, "password": pwd}
+            if proxy:
+                acc["proxy"] = proxy
+            cfg.setdefault("accounts", []).append(acc)
+            save_config(cfg)
+        _account_dialog(p, "Добавить аккаунт", lambda ev, ph, pw, px: on_save(ev, ph, pw, px))
+
+    def edit_account_dialog(e, idx):
+        cfg = load_config()
+        if not cfg or not (0 <= idx < len(cfg["accounts"])):
+            return
+        acc = cfg["accounts"][idx]
+        p = e.page
+        def on_save(ev, phone, pwd, proxy):
+            cfg = load_config()
+            if cfg and 0 <= idx < len(cfg["accounts"]):
+                cfg["accounts"][idx] = {"phone": phone, "password": pwd}
+                if proxy:
+                    cfg["accounts"][idx]["proxy"] = proxy
+                elif "proxy" in cfg["accounts"][idx]:
+                    del cfg["accounts"][idx]["proxy"]
+                save_config(cfg)
+        _account_dialog(p, "Редактировать аккаунт", on_save, acc["phone"], acc.get("password", ""), acc.get("proxy"))
+
+    def tdata_auth_dialog(e):
+        cfg = load_config()
+        if not cfg or not cfg.get("api_id") or not cfg.get("api_hash"):
+            def close_err(ev):
+                ev.page.pop_dialog()
+                ev.page.update()
+            err_dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Ошибка"),
+                content=ft.Text("Сначала настройте api_id и api_hash в Профиле."),
+                actions=[ft.Button("OK", on_click=close_err)],
+            )
+            e.page.show_dialog(err_dlg)
+            e.page.update()
+            return
+        p = e.page
+        tdata_path = str(TDATA_IMPORT_DIR.resolve())
+        log_text = ft.Text("", size=12, selectable=True, expand=True)
+        log_container = ft.Container(
+            content=ft.Column([ft.Text("Результат:", size=12, weight=ft.FontWeight.W_500), log_text], scroll=ft.ScrollMode.AUTO, height=160),
+        )
+        progress_text = ft.Text("", size=12, color=ft.Colors.GREY)
+        content = ft.Column([
+            ft.Text("Скопируйте папки tdata в указанную папку.", size=14),
+            ft.Text("Структура: каждая подпапка с tdata внутри = один аккаунт.", size=12, color=ft.Colors.GREY),
+            ft.Text("Пример: Account1/tdata, Account2/tdata — или одна папка tdata напрямую.", size=12, color=ft.Colors.GREY),
+            ft.Text(tdata_path, size=11, color=ft.Colors.PRIMARY, selectable=True, overflow=ft.TextOverflow.ELLIPSIS),
+            ft.Row([
+                ft.Button("Открыть папку", icon=ft.Icons.FOLDER_OPEN, on_click=lambda ev: (open_tdata_folder(), ev.page.update())),
+                ft.Button("Импортировать", icon=ft.Icons.UPLOAD, on_click=lambda ev: None),
+            ], spacing=12),
+            progress_text,
+            log_container,
+        ], spacing=12)
+        dlg = ft.AlertDialog(modal=True, title=ft.Text("Авторизация через tdata"), content=content, actions=[])
+        import_btn = content.controls[4].controls[1]
+        def do_import(ev):
+            import_btn.disabled = True
+            progress_text.value = "Импорт..."
             p.update()
-        dlg.actions = [
-            ft.TextButton("Отмена", on_click=cancel_add),
-            ft.Button("Добавить", on_click=save_add),
-        ]
+            def run():
+                def on_prog(ident, msg, ok):
+                    def upd():
+                        log_text.value = (log_text.value or "") + f"{ident}: {msg}\n"
+                        progress_text.value = "Обработка..."
+                        p.update()
+                    _run_on_page(p, upd)
+                try:
+                    phones = asyncio.run(import_tdata_folder(
+                        TDATA_IMPORT_DIR, cfg["api_id"], cfg["api_hash"], on_progress=on_prog
+                    ))
+                    def done():
+                        import_btn.disabled = False
+                        progress_text.value = f"Готово: импортировано {len(phones)} аккаунт(ов)"
+                        add_accounts_to_config(phones)
+                        refresh_list()
+                        p.update()
+                    _run_on_page(p, done)
+                except Exception as ex:
+                    def err():
+                        import_btn.disabled = False
+                        progress_text.value = f"Ошибка: {ex}"
+                        p.update()
+                    _run_on_page(p, err)
+            threading.Thread(target=run, daemon=True).start()
+        import_btn.on_click = do_import
+        def on_cancel(ev):
+            ev.page.pop_dialog()
+            ev.page.update()
+        dlg.actions = [ft.TextButton("Закрыть", on_click=on_cancel)]
+        p.show_dialog(dlg)
+        p.update()
+
+    def validate_accounts_dialog(e):
+        cfg = load_config()
+        if not cfg or not cfg.get("api_id") or not cfg.get("api_hash"):
+            def close_err(ev):
+                ev.page.pop_dialog()
+                ev.page.update()
+            err_dlg = ft.AlertDialog(
+                modal=True, title=ft.Text("Ошибка"),
+                content=ft.Text("Сначала настройте api_id и api_hash в Профиле."),
+                actions=[ft.Button("OK", on_click=close_err)],
+            )
+            e.page.show_dialog(err_dlg)
+            e.page.update()
+            return
+        authorized = [a for a in (cfg.get("accounts") or []) if is_account_authorized(a["phone"])]
+        if not authorized:
+            def close_err(ev):
+                ev.page.pop_dialog()
+                ev.page.update()
+            err_dlg = ft.AlertDialog(
+                modal=True, title=ft.Text("Ошибка"),
+                content=ft.Text("Нет авторизованных аккаунтов для проверки."),
+                actions=[ft.Button("OK", on_click=close_err)],
+            )
+            e.page.show_dialog(err_dlg)
+            e.page.update()
+            return
+        p = e.page
+        link_field = ft.TextField(label="Ссылка на тестовую группу", hint_text="t.me/group или t.me/joinchat/xxx", width=360, value=cfg.get("validation_test_link", ""))
+        msg_field = ft.TextField(label="Тестовое сообщение", value=cfg.get("validation_test_message", "Тест валидации"), width=360)
+        progress_bar = ft.ProgressBar(visible=False, expand=True)
+        counter_text = ft.Text("", size=14, color=ft.Colors.PRIMARY)
+        log_text = ft.Text("", size=12, selectable=True, expand=True)
+        log_container = ft.Container(content=ft.Column([ft.Text("Результаты:", size=12, weight=ft.FontWeight.W_500), log_text], scroll=ft.ScrollMode.AUTO, height=180))
+        run_btn = ft.Button("Запустить проверку", icon=ft.Icons.PLAY_ARROW)
+        content = ft.Column([
+            ft.Text("Для каждого аккаунта: вступление в группу → отправка сообщения → выход.", size=12, color=ft.Colors.GREY),
+            link_field,
+            msg_field,
+            ft.Row([progress_bar, counter_text], alignment=ft.MainAxisAlignment.START, spacing=12),
+            log_container,
+            run_btn,
+        ], spacing=12)
+        dlg = ft.AlertDialog(modal=True, title=ft.Text("Проверка на валидность"), content=content, actions=[])
+
+        def do_run(ev):
+            link = (link_field.value or "").strip()
+            if not link:
+                p.snack_bar = ft.SnackBar(ft.Text("Введите ссылку на тестовую группу"))
+                p.snack_bar.open = True
+                p.update()
+                return
+            run_btn.visible = False
+            progress_bar.visible = True
+            counter_text.value = "0 валидных, 0 ошибок из 0"
+            log_text.value = ""
+            p.update()
+            c = load_config()
+            c["validation_test_link"] = link
+            c["validation_test_message"] = msg_field.value or "Тест"
+            save_config(c)
+
+            def on_prog(validated, failed, total, phone, success, message):
+                def upd():
+                    done = validated + failed
+                    progress_bar.value = done / total if total else 0
+                    counter_text.value = f"{validated} валидных, {failed} ошибок из {total}"
+                    log_text.value = (log_text.value or "") + f"{phone}: {'✓' if success else '✗'} {message}\n"
+                    p.update()
+                _run_on_page(p, upd)
+
+            def run():
+                try:
+                    results = asyncio.run(validate_all_accounts(link, msg_field.value or "Тест", on_progress=on_prog))
+                    def done():
+                        run_btn.visible = True
+                        progress_bar.visible = False
+                        v_count = sum(1 for r in results if r["valid"])
+                        f_count = len(results) - v_count
+                        counter_text.value = f"Готово: {v_count} валидных, {f_count} ошибок"
+                        refresh_list()
+                        p.update()
+                    _run_on_page(p, done)
+                except Exception as ex:
+                    def err():
+                        run_btn.visible = True
+                        progress_bar.visible = False
+                        counter_text.value = f"Ошибка: {ex}"
+                        p.update()
+                    _run_on_page(p, err)
+            threading.Thread(target=run, daemon=True).start()
+
+        run_btn.on_click = do_run
+        def on_cancel(ev):
+            ev.page.pop_dialog()
+            ev.page.update()
+        dlg.actions = [ft.TextButton("Закрыть", on_click=on_cancel)]
         p.show_dialog(dlg)
         p.update()
 
@@ -178,7 +413,9 @@ def build_accounts_view(page):
             request_btn.disabled = True
             page.update()
             session_path = SESSIONS_DIR / phone.replace("+", "").replace(" ", "")
-            client = TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
+            acc = next((a for a in cfg["accounts"] if a["phone"] == phone), None)
+            proxy = (acc or {}).get("proxy") or cfg.get("proxy")
+            client = create_client(session_path, cfg["api_id"], cfg["api_hash"], proxy)
             def run():
                 try:
                     asyncio.run(request_code(client, phone))
@@ -216,7 +453,8 @@ def build_accounts_view(page):
             if not acc:
                 return
             session_path = SESSIONS_DIR / phone.replace("+", "").replace(" ", "")
-            client = TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
+            proxy = (acc or {}).get("proxy") or cfg.get("proxy")
+            client = create_client(session_path, cfg["api_id"], cfg["api_hash"], proxy)
             def run():
                 try:
                     asyncio.run(sign_in_with_code(client, phone, code, acc.get("password", "")))
@@ -251,10 +489,15 @@ def build_accounts_view(page):
                 ft.Row(
                     [
                         ft.Text("Аккаунты", size=24, weight=ft.FontWeight.BOLD),
-                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=add_account_dialog),
-                        ft.Button("Авторизовать", icon=ft.Icons.LOGIN, on_click=auth_account_dialog),
+                        ft.Row([
+                            ft.Button("Добавить", icon=ft.Icons.ADD, on_click=add_account_dialog),
+                            ft.Button("Авторизовать", icon=ft.Icons.LOGIN, on_click=auth_account_dialog),
+                            ft.Button("Через tdata", icon=ft.Icons.FOLDER_OPEN, on_click=tdata_auth_dialog),
+                            ft.Button("Проверить валидность", icon=ft.Icons.VERIFIED_USER, on_click=validate_accounts_dialog),
+                        ], spacing=8, wrap=True),
                     ],
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    wrap=True,
                 ),
                 ft.Divider(),
                 accounts_list,
@@ -316,34 +559,46 @@ def build_chats_view(page, on_refresh=None):
     status_text = ft.Text("", size=12, color=ft.Colors.GREY)
     links_list = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=4)
     pb = ft.ProgressBar(visible=False)
+    search_field = ft.TextField(
+        hint_text="Поиск по ссылке...",
+        width=320,
+        on_change=lambda e: refresh_links(),
+    )
 
     MAX_LINKS_DISPLAY = 10
+    MAX_LINKS_WHEN_FILTERED = 100
 
     def refresh_links():
         links_list.controls.clear()
         links = get_chat_links()
+        search_term = (search_field.value or "").strip().lower()
+        if search_term:
+            links = [lnk for lnk in links if search_term in (lnk or "").lower()]
         if not links:
-            links_list.controls.append(ft.Text("Нет ссылок. Импортируйте из xlsx.", color=ft.Colors.GREY))
+            links_list.controls.append(
+                ft.Text("Нет ссылок." + (" Ничего не найдено по запросу." if search_term else " Импортируйте из xlsx."), color=ft.Colors.GREY)
+            )
         else:
-            to_show = links[:MAX_LINKS_DISPLAY]
-            for i, link in enumerate(to_show):
+            limit = MAX_LINKS_WHEN_FILTERED if search_term else MAX_LINKS_DISPLAY
+            to_show = links[:limit]
+            for link in to_show:
                 links_list.controls.append(
                     ft.Row(
                         [
                             ft.Text(link, size=12, overflow=ft.TextOverflow.ELLIPSIS, expand=True),
-                            ft.IconButton(icon=ft.Icons.DELETE, icon_size=18, on_click=lambda e, idx=i: _delete_link(idx)),
+                            ft.IconButton(icon=ft.Icons.DELETE, icon_size=18, on_click=lambda e, lnk=link: _delete_link(lnk)),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     )
                 )
-            if len(links) > MAX_LINKS_DISPLAY:
-                links_list.controls.append(ft.Text(f"Показано {MAX_LINKS_DISPLAY} из {len(links)}", size=12, color=ft.Colors.GREY))
+            if len(links) > limit:
+                links_list.controls.append(ft.Text(f"Показано {limit} из {len(links)}", size=12, color=ft.Colors.GREY))
         page.update()
 
-    def _delete_link(idx):
+    def _delete_link(link):
         links = get_chat_links()
-        if 0 <= idx < len(links):
-            links.pop(idx)
+        if link in links:
+            links.remove(link)
             save_chat_links(links)
             refresh_links()
 
@@ -419,6 +674,7 @@ def build_chats_view(page, on_refresh=None):
             page.update()
 
             counter_text = ft.Text("0 вступлений, 0 ошибок", size=14)
+            cancel_event = threading.Event()
 
             def on_progress(joined, failed):
                 def update():
@@ -426,6 +682,13 @@ def build_chats_view(page, on_refresh=None):
                     page.update()
                 _run_on_page(page, update)
 
+            def on_stop(e):
+                cancel_event.set()
+                stop_btn.disabled = True
+                stop_btn.text = "Остановка..."
+                page.update()
+
+            stop_btn = ft.TextButton("Остановить", on_click=on_stop)
             progress_dlg = ft.AlertDialog(
                 modal=True,
                 title=ft.Text("Вступление в чаты"),
@@ -437,14 +700,14 @@ def build_chats_view(page, on_refresh=None):
                     tight=True,
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                actions=[],
+                actions=[stop_btn],
             )
             page.show_dialog(progress_dlg)
             page.update()
 
             def do_join_thread():
                 try:
-                    results = asyncio.run(run_join_all_links(links, on_progress=on_progress))
+                    results = asyncio.run(run_join_all_links(links, on_progress=on_progress, cancel_event=cancel_event))
                     total_joined = sum(r["joined"] for r in results)
                     total_failed = sum(r["failed"] for r in results)
                     summary = "\n".join([f"{r['phone']}: вступил в {r['joined']}, ошибок {r['failed']}" for r in results])
@@ -511,6 +774,7 @@ def build_chats_view(page, on_refresh=None):
                 ft.Row([pb, status_text], spacing=8),
                 ft.Text("Нажмите «Импорт из xlsx» и выберите файл. Скрипт сохраняет только ссылки (t.me/...).", size=12, color=ft.Colors.GREY),
                 ft.Text("Сохранённые ссылки:", size=14, weight=ft.FontWeight.W_500),
+                search_field,
                 links_list,
             ],
             expand=True,
@@ -521,6 +785,7 @@ def build_chats_view(page, on_refresh=None):
 
 
 def build_profile_view(page):
+    import json as _json
     cfg = load_config() or {}
     theme_dd = ft.Dropdown(
         label="Тема",
@@ -546,6 +811,100 @@ def build_profile_view(page):
         page.snack_bar = ft.SnackBar(ft.Text("Сохранено"))
         page.snack_bar.open = True
         page.update()
+
+    def do_export(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Экспорт настроек",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+            initialfile="spammer-bot-config-backup.json",
+        )
+        root.destroy()
+        if not path:
+            return
+        try:
+            c = load_config()
+            if not c:
+                page.snack_bar = ft.SnackBar(ft.Text("Нет настроек для экспорта"), bgcolor=ft.Colors.ERROR_CONTAINER)
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    _json.dump(c, f, ensure_ascii=False, indent=2)
+                page.snack_bar = ft.SnackBar(ft.Text(f"Настройки экспортированы: {path}"))
+            page.snack_bar.open = True
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
+            page.snack_bar.open = True
+        page.update()
+
+    def do_import(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Импорт настроек",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+        )
+        root.destroy()
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                imported = _json.load(f)
+            if not isinstance(imported, dict):
+                raise ValueError("Неверный формат файла")
+            save_config(imported)
+            page.snack_bar = ft.SnackBar(ft.Text("Настройки импортированы. Обновите страницу."))
+            page.snack_bar.open = True
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
+            page.snack_bar.open = True
+        page.update()
+
+    def show_reset_password_dialog(e):
+        from auth import AUTH_FILE
+        from core import DATA_DIR
+        p = e.page
+        info = ft.Text(
+            "Сброс пароля удалит текущий пароль. После этого необходимо закрыть приложение и перезапустить его — при следующем входе будет предложено задать новый пароль.\n\n"
+            "Или выполните в терминале:\npython manage.py reset-password",
+            size=12,
+            color=ft.Colors.GREY,
+        )
+        def do_reset(ev):
+            ev.page.pop_dialog()
+            ev.page.update()
+            try:
+                if AUTH_FILE.exists():
+                    AUTH_FILE.unlink()
+                if (DATA_DIR / ".remember").exists():
+                    (DATA_DIR / ".remember").unlink()
+                ev.page.snack_bar = ft.SnackBar(
+                    ft.Text("Пароль сброшен. Закройте приложение и перезапустите его — при следующем входе будет предложено задать новый пароль."),
+                    duration=6000,
+                )
+                ev.page.snack_bar.open = True
+            except Exception as ex:
+                ev.page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
+                ev.page.snack_bar.open = True
+            ev.page.update()
+        def on_cancel(ev):
+            ev.page.pop_dialog()
+            ev.page.update()
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Сброс пароля"),
+            content=ft.Column([info], tight=True),
+            actions=[
+                ft.TextButton("Отмена", on_click=on_cancel),
+                ft.Button("Сбросить пароль", on_click=do_reset),
+            ],
+        )
+        p.show_dialog(dlg)
+        p.update()
+
     return ft.Container(
         content=ft.Column(
             [
@@ -556,6 +915,15 @@ def build_profile_view(page):
                 ft.Text("API Telegram (https://my.telegram.org)", size=14),
                 ft.Row([api_id_field, api_hash_field], spacing=12),
                 ft.Button("Сохранить API", on_click=save_api),
+                ft.Divider(),
+                ft.Text("Экспорт / Импорт настроек", size=16, weight=ft.FontWeight.W_600),
+                ft.Row([
+                    ft.Button("Экспорт настроек", icon=ft.Icons.UPLOAD_FILE, on_click=do_export),
+                    ft.Button("Импорт настроек", icon=ft.Icons.DOWNLOAD, on_click=do_import),
+                ], spacing=12),
+                ft.Divider(),
+                ft.Text("Безопасность", size=16, weight=ft.FontWeight.W_600),
+                ft.Button("Сброс пароля", icon=ft.Icons.LOCK_RESET, on_click=show_reset_password_dialog),
             ],
             expand=True,
         ),
@@ -860,6 +1228,200 @@ def build_messages_view(page):
 
     refresh_attachments()
 
+    def _show_variables_help(e):
+        help_text = (
+            "Переменные для подстановки в текст:\n\n"
+            "• {имя} или {name} — название чата\n"
+            "• {номер}, {number}, {телефон}, {phone} — телефон аккаунта\n"
+            "• {участников} или {participants} — количество участников чата\n\n"
+            "Пример: «Привет, {имя}! Пишу из аккаунта {номер}»"
+        )
+        dlg = ft.AlertDialog(
+            title=ft.Text("Переменные в сообщении"),
+            content=ft.Text(help_text),
+            actions=[ft.TextButton("Понятно", on_click=lambda ev: (ev.page.pop_dialog(), ev.page.update()))],
+        )
+        page.show_dialog(dlg)
+        page.update()
+
+    def _build_preview_section(mf, pm_dd):
+        preview_text = ft.Text("", size=12, color=ft.Colors.GREY_700, selectable=True)
+        preview_container = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Предпросмотр", size=14, weight=ft.FontWeight.W_500),
+                    ft.Container(
+                        content=preview_text,
+                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                        padding=12,
+                        border_radius=8,
+                    ),
+                ],
+                tight=True,
+            ),
+        )
+
+        def update_preview(*_):
+            text = mf.value or ""
+            sample = substitute_variables(text, "Пример чата", "+7 900 123-45-67", 150)
+            preview_text.value = sample
+            if preview_text.page:
+                preview_text.update()
+
+        mf.on_change = lambda e: update_preview()
+        pm_dd.on_change = lambda e: update_preview()
+        # Начальное значение — без update(), т.к. контрол ещё не на странице
+        preview_text.value = substitute_variables(mf.value or "", "Пример чата", "+7 900 123-45-67", 150)
+        return preview_container
+
+    def _build_broadcast_settings_section(p):
+        cfg = load_config() or {}
+        delay_field = ft.TextField(
+            label="Задержка между сообщениями (сек)",
+            value=str(cfg.get("message_delay_sec", 2)),
+            width=180,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        test_mode_dd = ft.Dropdown(
+            label="Тестовый режим",
+            width=220,
+            value=cfg.get("test_mode") or "off",
+            options=[
+                ft.dropdown.Option("off", "Выключен"),
+                ft.dropdown.Option("self", "Только себе (Избранное)"),
+                ft.dropdown.Option("single_chat", "Один чат"),
+            ],
+        )
+        test_chat_field = ft.TextField(
+            label="Название чата (подстрока)",
+            value=cfg.get("test_chat_name", ""),
+            width=260,
+            hint_text="Для режима «Один чат»",
+            visible=(cfg.get("test_mode") == "single_chat"),
+        )
+
+        chat_f = cfg.get("chat_filter") or {}
+        inc_val = chat_f.get("include_by_name")
+        include_field = ft.TextField(
+            label="Включить чаты",
+            value=", ".join(inc_val) if isinstance(inc_val, list) else (inc_val or ""),
+            hint_text="Названия или подстроки через запятую (пусто = все)",
+        )
+
+        exc_val = chat_f.get("exclude_by_name")
+        exclude_field = ft.TextField(
+            label="Исключить чаты",
+            value=", ".join(exc_val) if isinstance(exc_val, list) else (exc_val or ""),
+            hint_text="Названия или подстроки через запятую",
+        )
+
+        min_p_field = ft.TextField(
+            hint_text="Мин. участников",
+            value=str(chat_f.get("min_participants") or ""),
+            width=120,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        max_p_field = ft.TextField(
+            hint_text="Макс. участников",
+            value=str(chat_f.get("max_participants") or ""),
+            width=120,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+
+        blacklist_field = ft.TextField(
+            label="Чёрный список",
+            value=", ".join(cfg.get("blacklist") or []),
+            hint_text="Названия чатов через запятую",
+        )
+        whitelist_field = ft.TextField(
+            label="Белый список",
+            value=", ".join(cfg.get("whitelist") or []),
+            hint_text="Названия чатов через запятую (если не пусто — только эти)",
+        )
+
+        use_vars_cb = ft.Checkbox(label="Подставлять переменные {имя}, {номер}", value=cfg.get("use_variables", True))
+        max_retries_field = ft.TextField(
+            label="Повторов при ошибке",
+            value=str(cfg.get("max_retries", 3)),
+            width=100,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            hint_text="1–5",
+        )
+
+        def _parse_list(s):
+            return [x.strip() for x in str(s or "").split(",") if x.strip()]
+
+        def save_broadcast_settings(ev):
+            c = load_config() or {}
+            try:
+                c["message_delay_sec"] = max(0, float(delay_field.value or 2))
+            except ValueError:
+                c["message_delay_sec"] = 2
+            c["test_mode"] = test_mode_dd.value or "off"
+            c["test_chat_name"] = (test_chat_field.value or "").strip()
+            c["chat_filter"] = {
+                "include_by_name": _parse_list(include_field.value),
+                "exclude_by_name": _parse_list(exclude_field.value),
+                "min_participants": int(min_p_field.value or 0) or 0,
+                "max_participants": int(max_p_field.value or 0) or 0,
+            }
+            c["blacklist"] = _parse_list(blacklist_field.value)
+            c["whitelist"] = _parse_list(whitelist_field.value)
+            c["use_variables"] = use_vars_cb.value
+            try:
+                r = int(max_retries_field.value or 3)
+                c["max_retries"] = max(1, min(5, r))
+            except ValueError:
+                c["max_retries"] = 3
+            save_config(c)
+            p.snack_bar = ft.SnackBar(ft.Text("Настройки рассылки сохранены"))
+            p.snack_bar.open = True
+            p.update()
+
+        def on_test_mode_change(e):
+            test_chat_field.visible = test_mode_dd.value == "single_chat"
+            p.update()
+
+        test_mode_dd.on_change = on_test_mode_change
+
+        participants_row = ft.Row(
+            [
+                ft.Text("Участников:", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                min_p_field,
+                ft.Text("—", size=14, color=ft.Colors.ON_SURFACE_VARIANT),
+                max_p_field,
+            ],
+            spacing=8,
+            alignment=ft.MainAxisAlignment.START,
+        )
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Настройки рассылки", size=16, weight=ft.FontWeight.W_600),
+                    ft.Divider(height=1),
+                    ft.Row([delay_field, test_mode_dd, test_chat_field], spacing=16, wrap=True),
+                    ft.Text("Фильтр по названию", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    include_field,
+                    exclude_field,
+                    participants_row,
+                    ft.Text("Списки чатов", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    blacklist_field,
+                    whitelist_field,
+                    ft.Divider(height=1),
+                    ft.Row([use_vars_cb, max_retries_field], spacing=16),
+                    ft.Row(
+                        [ft.Button("Сохранить настройки", icon=ft.Icons.SETTINGS, on_click=save_broadcast_settings)],
+                        alignment=ft.MainAxisAlignment.START,
+                    ),
+                ],
+                spacing=12,
+            ),
+            padding=16,
+            bgcolor=ft.Colors.SURFACE_CONTAINER,
+            border_radius=12,
+        )
+
     return ft.Container(
         content=ft.Column(
             [
@@ -879,7 +1441,17 @@ def build_messages_view(page):
                 format_toolbar,
                 ft.Divider(),
                 msg_field,
-                ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=lambda e: _do_save(page, msg_field, parse_mode_dd, attachments_list)),
+                ft.Row(
+                    [
+                        ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=lambda e: _do_save(page, msg_field, parse_mode_dd, attachments_list)),
+                        ft.IconButton(icon=ft.Icons.HELP_OUTLINE, tooltip="Переменные", on_click=lambda e: _show_variables_help(page)),
+                    ],
+                    spacing=8,
+                ),
+                ft.Container(height=8),
+                _build_preview_section(msg_field, parse_mode_dd),
+                ft.Container(height=8),
+                _build_broadcast_settings_section(page),
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
@@ -918,7 +1490,7 @@ def _run_on_page(page, fn):
         fn()
 
 
-def run_broadcast_thread(page, pb, status_text):
+def run_broadcast_thread(page, pb, status_text, counter_text=None):
     def show_code_dialog(phone):
         code_field = ft.TextField(label="Код из Telegram", width=300, autofocus=True)
         dlg = ft.AlertDialog(
@@ -944,13 +1516,28 @@ def run_broadcast_thread(page, pb, status_text):
             _run_on_page(page, lambda: show_code_dialog(p))
             return RESPONSE_QUEUE.get(timeout=120)
 
+        def on_progress(success, failed):
+            if counter_text is not None:
+                def update():
+                    counter_text.value = f"Отправлено: {success}, ошибок: {failed}"
+                    page.update()
+                _run_on_page(page, update)
+
         try:
-            _run_on_page(page, lambda: (setattr(status_text, "value", "Запуск..."), setattr(pb, "visible", True), page.update()))
-            stats = asyncio.run(run_broadcast(cfg, code_input=get_code))
+            def start_ui():
+                status_text.value = "Запуск рассылки..."
+                pb.visible = True
+                if counter_text:
+                    counter_text.value = "Отправлено: 0, ошибок: 0"
+                page.update()
+            _run_on_page(page, start_ui)
+            stats = asyncio.run(run_broadcast(cfg, code_input=get_code, on_progress=on_progress))
 
             def show_done():
                 setattr(status_text, "value", "Рассылка завершена")
                 setattr(pb, "visible", False)
+                if counter_text:
+                    counter_text.value = f"Готово: {stats['success']} отправлено, {stats['failed']} ошибок"
                 done_dlg = ft.AlertDialog(
                     modal=True,
                     title=ft.Text("Рассылка завершена"),
@@ -963,7 +1550,11 @@ def run_broadcast_thread(page, pb, status_text):
             _run_on_page(page, show_done)
         except Exception as ex:
             msg = str(ex)
-            _run_on_page(page, lambda m=msg: (setattr(status_text, "value", f"Ошибка: {m}"), setattr(pb, "visible", False), page.update()))
+            _run_on_page(page, lambda m=msg: (
+                setattr(status_text, "value", f"Ошибка: {m}"),
+                setattr(pb, "visible", False),
+                page.update()
+            ))
 
     t = threading.Thread(target=run)
     t.start()
@@ -1042,8 +1633,36 @@ def main(page: ft.Page):
             p.update()
 
         status_text = ft.Text("", size=12)
+        counter_text = ft.Text("", size=12, color=ft.Colors.PRIMARY)
         pb = ft.ProgressBar(visible=False)
-        start_btn = ft.Button("Запустить рассылку", icon=ft.Icons.SEND, on_click=lambda e: run_broadcast_thread(p, pb, status_text))
+
+        def on_start_click(e):
+            cfg = load_config()
+            if not cfg or not cfg.get("accounts") or not cfg.get("message"):
+                status_text.value = "Ошибка: добавьте аккаунты и сообщение"
+                p.update()
+                return
+            acc_count = len(cfg["accounts"])
+            confirm_dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Подтверждение рассылки"),
+                content=ft.Text(
+                    f"Будет выполнена рассылка сообщения с {acc_count} аккаунт(ов) во все подходящие чаты.\n\n"
+                    "Вы уверены, что хотите продолжить?"
+                ),
+                actions=[
+                    ft.TextButton("Отмена", on_click=lambda ev: (ev.page.pop_dialog(), ev.page.update())),
+                    ft.Button("Да, запустить", icon=ft.Icons.SEND, on_click=lambda ev: (
+                        ev.page.pop_dialog(),
+                        ev.page.update(),
+                        run_broadcast_thread(p, pb, status_text, counter_text)
+                    )),
+                ],
+            )
+            p.show_dialog(confirm_dlg)
+            p.update()
+
+        start_btn = ft.Button("Запустить рассылку", icon=ft.Icons.SEND, on_click=on_start_click)
 
         content_area.content = build_content(0)
         sidebar = build_sidebar(on_nav, 0)
@@ -1057,7 +1676,7 @@ def main(page: ft.Page):
                         [
                             ft.Row([content_area], expand=True),
                             ft.Divider(),
-                            ft.Row([start_btn, pb, status_text], alignment=ft.MainAxisAlignment.START),
+                            ft.Row([start_btn, pb, counter_text, status_text], alignment=ft.MainAxisAlignment.START, wrap=True),
                         ],
                         expand=True,
                     ),
