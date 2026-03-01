@@ -8,6 +8,40 @@ from tkinter import Tk, filedialog
 
 import flet as ft
 
+def _play_notify_sound():
+    def _do_play():
+        try:
+            cfg = load_config() or {}
+            sound_path = cfg.get("notify_sound_file", "")
+            if not sound_path or not Path(sound_path).exists():
+                _assets = Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "assets"
+                sound_path = _assets / "notification.mp3"
+            if Path(sound_path).exists():
+                from playsound3 import playsound
+                playsound(str(sound_path), block=False)
+            elif sys.platform == "win32":
+                import winsound
+                winsound.Beep(880, 120)
+        except Exception:
+            try:
+                if sys.platform == "win32":
+                    import winsound
+                    winsound.Beep(880, 120)
+            except Exception:
+                pass
+    threading.Thread(target=_do_play, daemon=True).start()
+
+def show_notify(page, message: str, is_error: bool = False, duration: int = 3000):
+    cfg = load_config() or {}
+    if cfg.get("notify_toast", True):
+        bg = ft.Colors.ERROR_CONTAINER if is_error else ft.Colors.PRIMARY_CONTAINER
+        page.snack_bar = ft.SnackBar(ft.Text(message), bgcolor=bg, duration=duration)
+        page.snack_bar.open = True
+    if cfg.get("notify_sound", True):
+        _play_notify_sound()
+    page.update()
+
+from ai_generate import generate_vacancy_text
 from auth import clear_remember, is_remembered, save_remember, verify
 from broadcast import auth_account, create_client, request_code, run_broadcast, run_dm_broadcast, sign_in_with_code, substitute_variables
 from chats import extract_links_from_xlsx, run_join_all_links, run_leave_all_chats
@@ -32,6 +66,8 @@ from core import (
 )
 from dashboard import build_error_log_content, get_alerts_grouped
 from errors import ACCORDION_CATEGORIES, get_level_style
+from schedule import get_next_run, mark_run, run_scheduler
+from tray import run_tray
 from tdata_import import add_accounts_to_config, import_tdata_folder, open_tdata_folder
 from validate_accounts import validate_all_accounts
 WIDTH = 1100
@@ -46,19 +82,138 @@ def build_sidebar(on_nav, selected_index):
         label_type=ft.NavigationRailLabelType.ALL,
         min_width=80,
         min_extended_width=200,
-        leading=ft.Container(
-            content=ft.Icon(ft.Icons.SEND, size=36),
-            margin=ft.Margin.only(bottom=20),
-        ),
         destinations=[
+            ft.NavigationRailDestination(icon=ft.Icons.HOME, label="Главная"),
             ft.NavigationRailDestination(icon=ft.Icons.PEOPLE, label="Аккаунты"),
             ft.NavigationRailDestination(icon=ft.Icons.ANALYTICS, label="Статистика"),
             ft.NavigationRailDestination(icon=ft.Icons.NOTIFICATIONS, label="Уведомления"),
             ft.NavigationRailDestination(icon=ft.Icons.PERSON, label="Профиль"),
             ft.NavigationRailDestination(icon=ft.Icons.MESSAGE, label="Сообщения"),
+            ft.NavigationRailDestination(icon=ft.Icons.SCHEDULE, label="Расписание"),
             ft.NavigationRailDestination(icon=ft.Icons.MAIL, label="В личку"),
             ft.NavigationRailDestination(icon=ft.Icons.FORUM, label="Чаты"),
         ],
+    )
+
+
+def build_home_view(page, on_nav):
+    stats = get_stats()
+    cfg = load_config() or {}
+    accounts = cfg.get("accounts") or []
+    accounts_count = len(accounts)
+    auth_count = sum(1 for a in accounts if is_account_authorized(a.get("phone", "")))
+    chats_count = len(get_chat_links())
+    templates_count = len(get_templates() or [])
+    next_run = get_next_run(cfg)
+    next_run_str = next_run.strftime("%d.%m.%Y %H:%M") if next_run else "—"
+
+    total = stats["total_sent"] + stats["total_failed"]
+    sent_pct = (stats["total_sent"] / total * 100) if total else 50
+    failed_pct = (stats["total_failed"] / total * 100) if total else 50
+
+    if total > 0:
+        bar_w = 200
+        sw = max(8, int(bar_w * sent_pct / 100))
+        fw = max(8, int(bar_w * failed_pct / 100))
+        chart_row = ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Отправлено / Ошибок", size=12, weight=ft.FontWeight.W_500),
+                        ft.Text(f"{stats['total_sent']} / {stats['total_failed']}", size=12, color=ft.Colors.GREY),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Container(width=sw, height=24, bgcolor=ft.Colors.GREEN, border_radius=4),
+                            ft.Container(width=fw, height=24, bgcolor=ft.Colors.ERROR, border_radius=4),
+                        ],
+                        spacing=2,
+                    ),
+                ),
+            ],
+            spacing=4,
+        )
+    else:
+        chart_row = ft.Text("Нет данных рассылки", size=12, color=ft.Colors.GREY)
+
+    last_lines = (stats.get("last_lines") or [])[-5:][::-1]
+    last_activity = ft.Column(
+        [ft.Text(ln[:70] + ("..." if len(ln) > 70 else ""), size=11, color=ft.Colors.ON_SURFACE_VARIANT) for ln in last_lines] if last_lines else [ft.Text("—", size=12, color=ft.Colors.GREY)],
+        spacing=2,
+    )
+
+    def _card(title, value, icon, color=ft.Colors.PRIMARY, on_click=None):
+        c = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Icon(icon, color=color, size=28),
+                    ft.Text(str(value), size=24, weight=ft.FontWeight.BOLD),
+                    ft.Text(title, size=12, color=ft.Colors.GREY),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=4,
+            ),
+            padding=20,
+            width=140,
+            border_radius=12,
+            bgcolor=ft.Colors.SURFACE_CONTAINER,
+        )
+        if on_click:
+            return ft.GestureDetector(content=ft.Card(content=c), on_tap=lambda e: on_nav(on_click))
+        return ft.Card(content=c)
+
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Обзор", size=20, weight=ft.FontWeight.BOLD),
+                ft.Divider(height=1),
+                ft.Row(
+                    [
+                        _card("Отправлено", stats["total_sent"], ft.Icons.CHECK_CIRCLE, ft.Colors.GREEN, 2),
+                        _card("Ошибок", stats["total_failed"], ft.Icons.ERROR, ft.Colors.ERROR, 2),
+                        _card("Аккаунтов", f"{auth_count}/{accounts_count}", ft.Icons.PEOPLE, ft.Colors.PRIMARY, 1),
+                        _card("Чатов", chats_count, ft.Icons.FORUM, ft.Colors.TEAL, 8),
+                        _card("Шаблонов", templates_count, ft.Icons.BOOKMARK, ft.Colors.AMBER, 5),
+                    ],
+                    spacing=12,
+                    wrap=True,
+                ),
+                ft.Container(height=12),
+                ft.Text("Рассылка: успех / ошибки", size=14, weight=ft.FontWeight.W_500),
+                chart_row,
+                ft.Container(height=12),
+                ft.Row(
+                    [
+                        ft.Column(
+                            [
+                                ft.Text("Следующая рассылка", size=14, weight=ft.FontWeight.W_500),
+                                ft.Text(next_run_str, size=12, color=ft.Colors.GREY),
+                            ],
+                            spacing=2,
+                            expand=True,
+                        ),
+                        ft.TextButton("Расписание →", on_click=lambda e: on_nav(6)),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                ft.Container(height=12),
+                ft.Text("Последняя активность", size=14, weight=ft.FontWeight.W_500),
+                ft.Container(
+                    content=last_activity,
+                    padding=12,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER,
+                    border_radius=8,
+                ),
+                ft.TextButton("Вся статистика →", on_click=lambda e: on_nav(2)),
+            ],
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+            spacing=8,
+        ),
+        padding=20,
     )
 
 
@@ -259,12 +414,14 @@ def build_accounts_view(page):
                         progress_text.value = f"Готово: импортировано {len(phones)} аккаунт(ов)"
                         add_accounts_to_config(phones)
                         refresh_list()
+                        show_notify(p, f"Импорт tdata: {len(phones)} аккаунт(ов)")
                         p.update()
                     _run_on_page(p, done)
                 except Exception as ex:
                     def err():
                         import_btn.disabled = False
                         progress_text.value = f"Ошибка: {ex}"
+                        show_notify(p, f"Ошибка импорта: {ex}", is_error=True)
                         p.update()
                     _run_on_page(p, err)
             threading.Thread(target=run, daemon=True).start()
@@ -280,9 +437,7 @@ def build_accounts_view(page):
         cfg = load_config()
         count = len((cfg or {}).get("accounts") or [])
         if count == 0:
-            e.page.snack_bar = ft.SnackBar(ft.Text("Нет аккаунтов для очистки."), bgcolor=ft.Colors.GREY_700)
-            e.page.snack_bar.open = True
-            e.page.update()
+            show_notify(e.page, "Нет аккаунтов для очистки.", is_error=False)
             return
 
         def confirm_clear(ev):
@@ -291,9 +446,7 @@ def build_accounts_view(page):
             save_config(c)
             ev.page.pop_dialog()
             refresh_list()
-            ev.page.snack_bar = ft.SnackBar(ft.Text(f"Удалено {count} аккаунт(ов)."), bgcolor=ft.Colors.PRIMARY_CONTAINER)
-            ev.page.snack_bar.open = True
-            ev.page.update()
+            show_notify(ev.page, f"Удалено {count} аккаунт(ов).")
 
         def cancel(ev):
             ev.page.pop_dialog()
@@ -359,9 +512,7 @@ def build_accounts_view(page):
         def do_run(ev):
             link = (link_field.value or "").strip()
             if not link:
-                p.snack_bar = ft.SnackBar(ft.Text("Введите ссылку на тестовую группу"))
-                p.snack_bar.open = True
-                p.update()
+                show_notify(p, "Введите ссылку на тестовую группу", is_error=False)
                 return
             run_btn.visible = False
             progress_bar.visible = True
@@ -392,6 +543,7 @@ def build_accounts_view(page):
                         f_count = len(results) - v_count
                         counter_text.value = f"Готово: {v_count} валидных, {f_count} ошибок"
                         refresh_list()
+                        show_notify(p, f"Проверка валидности: {v_count} валидных, {f_count} ошибок", duration=5000)
                         p.update()
                     _run_on_page(p, done)
                 except Exception as ex:
@@ -399,6 +551,7 @@ def build_accounts_view(page):
                         run_btn.visible = True
                         progress_bar.visible = False
                         counter_text.value = f"Ошибка: {ex}"
+                        show_notify(p, f"Ошибка проверки: {ex}", is_error=True)
                         p.update()
                     _run_on_page(p, err)
             threading.Thread(target=run, daemon=True).start()
@@ -502,8 +655,7 @@ def build_accounts_view(page):
                 except Exception as ex:
                     err = str(ex)
                     def show_err():
-                        page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {err}"), bgcolor=ft.Colors.ERROR_CONTAINER)
-                        page.snack_bar.open = True
+                        show_notify(page, f"Ошибка: {err}", is_error=True)
                         refresh_list()
                         page.update()
                     _run_on_page(page, show_err)
@@ -631,11 +783,9 @@ def build_notifications_view(page):
             content = build_error_log_content()
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
-            page.snack_bar = ft.SnackBar(ft.Text(f"Лог сохранён: {path}"))
-            page.snack_bar.open = True
+            show_notify(page, f"Лог сохранён: {path}")
         except Exception as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
-            page.snack_bar.open = True
+            show_notify(page, f"Ошибка: {ex}", is_error=True)
         page.update()
 
     download_btn = ft.OutlinedButton(
@@ -757,9 +907,7 @@ def build_chats_view(page, on_refresh=None):
         links = get_chat_links()
         count = len(links)
         if count == 0:
-            page.snack_bar = ft.SnackBar(ft.Text("Нет ссылок для удаления."), bgcolor=ft.Colors.GREY_700)
-            page.snack_bar.open = True
-            page.update()
+            show_notify(page, "Нет ссылок для удаления.", is_error=False)
             return
 
         def confirm_clear(ev):
@@ -769,9 +917,7 @@ def build_chats_view(page, on_refresh=None):
             if on_refresh:
                 on_refresh()
             status_text.value = f"Удалено {count} ссылок"
-            ev.page.snack_bar = ft.SnackBar(ft.Text(f"Удалено {count} ссылок."), bgcolor=ft.Colors.PRIMARY_CONTAINER)
-            ev.page.snack_bar.open = True
-            ev.page.update()
+            show_notify(ev.page, f"Удалено {count} ссылок.")
 
         def cancel(ev):
             ev.page.pop_dialog()
@@ -827,12 +973,14 @@ def build_chats_view(page, on_refresh=None):
                     refresh_links()
                     if on_refresh:
                         on_refresh()
+                    show_notify(page, f"Импорт xlsx: {len(new_links)} ссылок")
                     page.update()
                 _run_on_page(page, done)
             except Exception as ex:
                 def err():
                     page.pop_dialog()
                     status_text.value = f"Ошибка: {ex}"
+                    show_notify(page, f"Ошибка импорта: {ex}", is_error=True)
                     page.update()
                 _run_on_page(page, err)
 
@@ -901,14 +1049,14 @@ def build_chats_view(page, on_refresh=None):
                     def done():
                         page.pop_dialog()
                         status_text.value = f"Готово. Вступлений: {total_joined}, ошибок: {total_failed}"
-                        page.snack_bar = ft.SnackBar(ft.Text(summary), duration=5000)
-                        page.snack_bar.open = True
+                        show_notify(page, summary, duration=5000)
                         page.update()
                     _run_on_page(page, done)
                 except Exception as ex:
                     def err():
                         page.pop_dialog()
                         status_text.value = f"Ошибка: {ex}"
+                        show_notify(page, f"Ошибка: {ex}", is_error=True)
                         page.update()
                     _run_on_page(page, err)
 
@@ -989,14 +1137,14 @@ def build_chats_view(page, on_refresh=None):
                     def done():
                         page.pop_dialog()
                         status_text.value = f"Готово. Выходов: {total_left}, ошибок: {total_failed}"
-                        page.snack_bar = ft.SnackBar(ft.Text(summary), duration=5000)
-                        page.snack_bar.open = True
+                        show_notify(page, summary, duration=5000)
                         page.update()
                     _run_on_page(page, done)
                 except Exception as ex:
                     def err():
                         page.pop_dialog()
                         status_text.value = f"Ошибка: {ex}"
+                        show_notify(page, f"Ошибка: {ex}", is_error=True)
                         page.update()
                     _run_on_page(page, err)
             threading.Thread(target=do_leave_thread, daemon=True).start()
@@ -1065,6 +1213,41 @@ def build_profile_view(page):
         ],
     )
     theme_dd.on_select = lambda e: apply_theme(page, e.control.value)
+    notify_toast_cb = ft.Checkbox(label="Уведомления (тост)", value=cfg.get("notify_toast", True))
+    notify_sound_cb = ft.Checkbox(label="Звук при действиях", value=cfg.get("notify_sound", True))
+    default_sound = str((Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "assets" / "notification.mp3"))
+    notify_sound_field = ft.TextField(
+        label="Файл звука (mp3)",
+        value=cfg.get("notify_sound_file", "") or default_sound,
+        hint_text="Путь к notification.mp3",
+        width=400,
+    )
+
+    def pick_sound_file(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Выберите звуковой файл",
+            filetypes=[("MP3", "*.mp3"), ("Все файлы", "*.*")],
+        )
+        root.destroy()
+        if path:
+            notify_sound_field.value = path
+            c = load_config() or {}
+            c["notify_sound_file"] = path
+            save_config(c)
+            show_notify(page, "Звук сохранён")
+            page.update()
+
+    def save_notify_settings(e):
+        c = load_config() or {}
+        c["notify_toast"] = notify_toast_cb.value
+        c["notify_sound"] = notify_sound_cb.value
+        c["notify_sound_file"] = (notify_sound_field.value or "").strip() or None
+        save_config(c)
+        show_notify(page, "Настройки уведомлений сохранены")
+
     api_id_field = ft.TextField(label="api_id", value=str(cfg.get("api_id", "")), width=200)
     api_hash_field = ft.TextField(label="api_hash", value=cfg.get("api_hash", ""), width=280, password=True)
     def save_api(e):
@@ -1075,9 +1258,7 @@ def build_profile_view(page):
             pass
         c["api_hash"] = api_hash_field.value or ""
         save_config(c)
-        page.snack_bar = ft.SnackBar(ft.Text("Сохранено"))
-        page.snack_bar.open = True
-        page.update()
+        show_notify(page, "Сохранено")
 
     def do_export(e):
         root = Tk()
@@ -1095,15 +1276,13 @@ def build_profile_view(page):
         try:
             c = load_config()
             if not c:
-                page.snack_bar = ft.SnackBar(ft.Text("Нет настроек для экспорта"), bgcolor=ft.Colors.ERROR_CONTAINER)
+                show_notify(page, "Нет настроек для экспорта", is_error=True)
             else:
                 with open(path, "w", encoding="utf-8") as f:
                     _json.dump(c, f, ensure_ascii=False, indent=2)
-                page.snack_bar = ft.SnackBar(ft.Text(f"Настройки экспортированы: {path}"))
-            page.snack_bar.open = True
+                show_notify(page, f"Настройки экспортированы: {path}")
         except Exception as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
-            page.snack_bar.open = True
+            show_notify(page, f"Ошибка: {ex}", is_error=True)
         page.update()
 
     def do_import(e):
@@ -1123,11 +1302,9 @@ def build_profile_view(page):
             if not isinstance(imported, dict):
                 raise ValueError("Неверный формат файла")
             save_config(imported)
-            page.snack_bar = ft.SnackBar(ft.Text("Настройки импортированы. Обновите страницу."))
-            page.snack_bar.open = True
+            show_notify(page, "Настройки импортированы. Обновите страницу.")
         except Exception as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
-            page.snack_bar.open = True
+            show_notify(page, f"Ошибка: {ex}", is_error=True)
         page.update()
 
     def show_reset_password_dialog(e):
@@ -1148,14 +1325,9 @@ def build_profile_view(page):
                     AUTH_FILE.unlink()
                 if (DATA_DIR / ".remember").exists():
                     (DATA_DIR / ".remember").unlink()
-                ev.page.snack_bar = ft.SnackBar(
-                    ft.Text("Пароль сброшен. Закройте приложение и перезапустите его — при следующем входе будет предложено задать новый пароль."),
-                    duration=6000,
-                )
-                ev.page.snack_bar.open = True
+                show_notify(ev.page, "Пароль сброшен. Закройте приложение и перезапустите его — при следующем входе будет предложено задать новый пароль.", duration=6000)
             except Exception as ex:
-                ev.page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
-                ev.page.snack_bar.open = True
+                show_notify(ev.page, f"Ошибка: {ex}", is_error=True)
             ev.page.update()
         def on_cancel(ev):
             ev.page.pop_dialog()
@@ -1179,6 +1351,11 @@ def build_profile_view(page):
                 ft.Divider(),
                 ft.Row([ft.Text("Тема:"), theme_dd], alignment=ft.MainAxisAlignment.START),
                 ft.Divider(),
+                ft.Text("Уведомления", size=16, weight=ft.FontWeight.W_600),
+                ft.Row([notify_toast_cb, notify_sound_cb], spacing=24),
+                ft.Row([notify_sound_field, ft.Button("Выбрать файл", icon=ft.Icons.AUDIO_FILE, on_click=pick_sound_file)], spacing=8),
+                ft.Button("Применить", icon=ft.Icons.NOTIFICATIONS_ACTIVE, on_click=save_notify_settings),
+                ft.Divider(),
                 ft.Text("API Telegram (https://my.telegram.org)", size=14),
                 ft.Row([api_id_field, api_hash_field], spacing=12),
                 ft.Button("Сохранить API", on_click=save_api),
@@ -1193,6 +1370,7 @@ def build_profile_view(page):
                 ft.Button("Сброс пароля", icon=ft.Icons.LOCK_RESET, on_click=show_reset_password_dialog),
             ],
             expand=True,
+            scroll=ft.ScrollMode.AUTO,
         ),
         padding=20,
     )
@@ -1291,6 +1469,7 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
                         pb.visible = False
                     if counter_text:
                         counter_text.value = f"Готово: {stats['success']} в ЛС, {stats['failed']} ошибок"
+                    show_notify(page, f"Рассылка в личку: {stats['success']} отправлено, {stats['failed']} ошибок", duration=5000)
                     dlg = ft.AlertDialog(
                         modal=True,
                         title=ft.Text("Рассылка в личку завершена"),
@@ -1306,6 +1485,7 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
                         status_text.value = f"Ошибка: {ex}"
                     if pb:
                         pb.visible = False
+                    show_notify(page, f"Ошибка рассылки: {ex}", is_error=True)
                     page.update()
                 _run_on_page(page, err)
         threading.Thread(target=run, daemon=True).start()
@@ -1329,9 +1509,7 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
     def on_start_dm(e):
         links = get_chat_links() or []
         if not links:
-            page.snack_bar = ft.SnackBar(ft.Text("Нет ссылок в базе. Импортируйте в разделе «Чаты»."))
-            page.snack_bar.open = True
-            page.update()
+            show_notify(page, "Нет ссылок в базе. Импортируйте в разделе «Чаты».")
             return
         acc_count = len([a for a in (load_config() or {}).get("accounts", []) if is_account_authorized(a["phone"])])
         confirm_dlg = ft.AlertDialog(
@@ -1472,9 +1650,7 @@ def build_messages_view(page):
             ev.page.pop_dialog()
             template_dd.options = [ft.dropdown.Option(_NONE_OPT, _NONE_OPT)] + [ft.dropdown.Option(t["name"], t["name"]) for t in get_templates()]
             template_dd.value = name
-            ev.page.snack_bar = ft.SnackBar(ft.Text(f"Шаблон «{name}» сохранён"))
-            ev.page.snack_bar.open = True
-            ev.page.update()
+            show_notify(ev.page, f"Шаблон «{name}» сохранён")
 
         dlg = ft.AlertDialog(
             title=ft.Text("Сохранить как шаблон"),
@@ -1487,9 +1663,7 @@ def build_messages_view(page):
     def delete_template_click(e):
         val = template_dd.value
         if not val or val == _NONE_OPT:
-            page.snack_bar = ft.SnackBar(ft.Text("Выберите шаблон для удаления"))
-            page.snack_bar.open = True
-            page.update()
+            show_notify(page, "Выберите шаблон для удаления")
             return
 
         def do_delete(ev):
@@ -1497,9 +1671,7 @@ def build_messages_view(page):
             ev.page.pop_dialog()
             template_dd.options = [ft.dropdown.Option(_NONE_OPT, _NONE_OPT)] + [ft.dropdown.Option(t["name"], t["name"]) for t in get_templates()]
             template_dd.value = _NONE_OPT
-            ev.page.snack_bar = ft.SnackBar(ft.Text(f"Шаблон «{val}» удалён"))
-            ev.page.snack_bar.open = True
-            ev.page.update()
+            show_notify(ev.page, f"Шаблон «{val}» удалён")
 
         dlg = ft.AlertDialog(
             title=ft.Text("Удалить шаблон?"),
@@ -1518,15 +1690,13 @@ def build_messages_view(page):
                 _do_save(page, msg_field, parse_mode_dd, attachments_list)
             else:
                 if fmt_type != "link":
-                    page.snack_bar = ft.SnackBar(ft.Text("Выделите текст в поле сообщения"))
-                    page.snack_bar.open = True
+                    show_notify(page, "Выделите текст в поле сообщения")
             page.update()
         return handler
 
     def link_format_click(e):
         if not last_selection[0] or last_selection[0].is_collapsed:
-            page.snack_bar = ft.SnackBar(ft.Text("Выделите текст для ссылки"))
-            page.snack_bar.open = True
+            show_notify(page, "Выделите текст для ссылки")
             page.update()
             return
         url_field = ft.TextField(label="URL", width=350, hint_text="https://...")
@@ -1618,13 +1788,110 @@ def build_messages_view(page):
                         stored = add_file_to_storage(f.path)
                         attachments_list.append(stored)
                     except Exception as ex:
-                        page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
-                        page.snack_bar.open = True
+                        show_notify(page, f"Ошибка: {ex}", is_error=True)
             refresh_attachments()
             _do_save(page, msg_field, parse_mode_dd, attachments_list)
             page.update()
 
     refresh_attachments()
+
+    def ai_generate_click(e):
+        pos_field = ft.TextField(label="Должность", value="", width=400, hint_text="Например: Строитель, Монтажник")
+        desc_field = ft.TextField(label="Описание / обязанности", value="", multiline=True, min_lines=2, width=400)
+        req_field = ft.TextField(label="Требования", value="", multiline=True, min_lines=1, width=400)
+        salary_field = ft.TextField(label="Зарплата", value="", width=400, hint_text="Например: от 80 000 руб")
+        contacts_field = ft.TextField(label="Контакты", value="", width=400, hint_text="Написать в личку")
+        extra_field = ft.TextField(label="Доп. пожелания", value="", multiline=True, min_lines=1, width=400)
+        backend_dd = ft.Dropdown(
+            label="Сервис",
+            width=220,
+            value=cfg.get("ai_backend", "g4f"),
+            options=[
+                ft.dropdown.Option("g4f", "g4f (бесплатно, без ключа)"),
+                ft.dropdown.Option("openrouter", "OpenRouter (бесплатный тариф)"),
+            ],
+        )
+        api_key_field = ft.TextField(
+            label="API ключ OpenRouter",
+            value=cfg.get("openrouter_api_key", ""),
+            width=400,
+            password=True,
+            visible=(cfg.get("ai_backend", "g4f") == "openrouter"),
+        )
+        status_text = ft.Text("", size=12, color=ft.Colors.GREY_700)
+        gen_btn = ft.Button("Сгенерировать", icon=ft.Icons.AUTO_AWESOME)
+
+        def on_backend_change(ev):
+            api_key_field.visible = backend_dd.value == "openrouter"
+            page.update()
+
+        backend_dd.on_change = on_backend_change
+
+        def do_generate(ev):
+            backend = backend_dd.value or "g4f"
+            api_key = (api_key_field.value or "").strip() if backend == "openrouter" else None
+            if backend == "openrouter" and not api_key:
+                status_text.value = "Укажите API ключ OpenRouter"
+                status_text.color = ft.Colors.ERROR
+                page.update()
+                return
+            gen_btn.visible = False
+            status_text.value = "Генерация… подождите"
+            status_text.color = ft.Colors.GREY_700
+            page.update()
+            try:
+                c = load_config() or {}
+                c["ai_backend"] = backend
+                if backend == "openrouter" and api_key:
+                    c["openrouter_api_key"] = api_key
+                save_config(c)
+                text = generate_vacancy_text(
+                    position=pos_field.value or "",
+                    description=desc_field.value or "",
+                    requirements=req_field.value or "",
+                    salary=salary_field.value or "",
+                    contacts=contacts_field.value or "",
+                    extra=extra_field.value or "",
+                    backend=backend,
+                    api_key=api_key,
+                )
+                msg_field.value = text
+                _do_save(page, msg_field, parse_mode_dd, attachments_list)
+                ev.page.pop_dialog()
+                show_notify(ev.page, "Текст сгенерирован")
+            except Exception as ex:
+                status_text.value = str(ex)
+                status_text.color = ft.Colors.ERROR
+                gen_btn.visible = True
+            ev.page.update()
+
+        dlg = ft.AlertDialog(
+            title=ft.Text("Сгенерировать текст вакансии (ИИ)"),
+            content=ft.Container(
+                content=ft.Column(
+                    [
+                        pos_field,
+                        desc_field,
+                        req_field,
+                        salary_field,
+                        contacts_field,
+                        extra_field,
+                        ft.Row([backend_dd, api_key_field], spacing=12, wrap=True),
+                        status_text,
+                    ],
+                    tight=True,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                width=450,
+            ),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda ev: (ev.page.pop_dialog(), ev.page.update())),
+                gen_btn,
+            ],
+        )
+        gen_btn.on_click = do_generate
+        page.show_dialog(dlg)
+        page.update()
 
     def _show_variables_help(e):
         help_text = (
@@ -1771,8 +2038,7 @@ def build_messages_view(page):
             except ValueError:
                 c["max_retries"] = 3
             save_config(c)
-            p.snack_bar = ft.SnackBar(ft.Text("Настройки рассылки сохранены"))
-            p.snack_bar.open = True
+            show_notify(p, "Настройки рассылки сохранены")
             p.update()
 
         def on_test_mode_change(e):
@@ -1841,6 +2107,7 @@ def build_messages_view(page):
                 ft.Row(
                     [
                         ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=lambda e: _do_save(page, msg_field, parse_mode_dd, attachments_list)),
+                        ft.Button("Сгенерировать ИИ", icon=ft.Icons.AUTO_AWESOME, on_click=ai_generate_click, visible=False),
                         ft.IconButton(icon=ft.Icons.HELP_OUTLINE, tooltip="Переменные", on_click=lambda e: _show_variables_help(page)),
                     ],
                     spacing=8,
@@ -1849,6 +2116,96 @@ def build_messages_view(page):
                 _build_preview_section(msg_field, parse_mode_dd),
                 ft.Container(height=8),
                 _build_broadcast_settings_section(page),
+            ],
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        padding=20,
+    )
+
+
+def build_schedule_view(page, run_broadcast_callback, schedule_status_ref):
+    cfg = load_config() or {}
+    enabled_cb = ft.Checkbox(label="Включить отложенную рассылку", value=cfg.get("schedule_enabled", False))
+    type_dd = ft.Dropdown(
+        label="Тип",
+        width=200,
+        value=cfg.get("schedule_type") or "once",
+        options=[
+            ft.dropdown.Option("once", "Один раз в указанное время"),
+            ft.dropdown.Option("interval", "С переодичностью (каждые N минут)"),
+            ft.dropdown.Option("daily", "Ежедневно в указанное время"),
+        ],
+    )
+    today = datetime.now().strftime("%Y-%m-%d")
+    once_date = ft.TextField(label="Дата (ГГГГ-ММ-ДД)", value=cfg.get("schedule_once_date") or today, width=160, hint_text="2025-03-10")
+    once_time = ft.TextField(label="Время (ЧЧ:ММ)", value=cfg.get("schedule_once_time") or "09:00", width=100)
+    interval_min = ft.TextField(label="Интервал (минут)", value=str(cfg.get("schedule_interval_minutes") or 60), width=120, keyboard_type=ft.KeyboardType.NUMBER)
+    daily_time = ft.TextField(label="Время (ЧЧ:ММ)", value=cfg.get("schedule_daily_time") or "09:00", width=100)
+    next_run_text = ft.Text("", size=12, color=ft.Colors.GREY)
+    status_text = ft.Text("", size=12, color=ft.Colors.PRIMARY)
+
+    once_row = ft.Row([once_date, once_time], spacing=12)
+    interval_row = ft.Row([interval_min], spacing=12)
+    daily_row = ft.Row([daily_time], spacing=12)
+
+    def update_visibility(e=None):
+        t = type_dd.value or "once"
+        once_row.visible = t == "once"
+        interval_row.visible = t == "interval"
+        daily_row.visible = t == "daily"
+        page.update()
+
+    def refresh_next():
+        c = load_config() or {}
+        enabled_cb.value = c.get("schedule_enabled", False)
+        type_dd.value = c.get("schedule_type") or "once"
+        once_date.value = c.get("schedule_once_date") or today
+        once_time.value = c.get("schedule_once_time") or "09:00"
+        interval_min.value = str(c.get("schedule_interval_minutes") or 60)
+        daily_time.value = c.get("schedule_daily_time") or "09:00"
+        next_run = get_next_run(c)
+        if next_run:
+            next_run_text.value = f"Следующий запуск: {next_run.strftime('%Y-%m-%d %H:%M')}"
+        else:
+            next_run_text.value = "Расписание не активно или уже выполнено"
+
+    def save_schedule(e):
+        c = load_config() or {}
+        c["schedule_enabled"] = enabled_cb.value
+        c["schedule_type"] = type_dd.value or "once"
+        c["schedule_once_date"] = (once_date.value or "").strip()
+        c["schedule_once_time"] = (once_time.value or "09:00").strip()
+        try:
+            c["schedule_interval_minutes"] = max(1, int(interval_min.value or 60))
+        except ValueError:
+            c["schedule_interval_minutes"] = 60
+        c["schedule_daily_time"] = (daily_time.value or "09:00").strip()
+        save_config(c)
+        refresh_next()
+        show_notify(page, "Расписание сохранено")
+        if schedule_status_ref:
+            schedule_status_ref[0] = c.get("schedule_enabled", False)
+        page.update()
+
+    type_dd.on_change = update_visibility
+    update_visibility()
+    refresh_next()
+
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Отложенная рассылка", size=24, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Text("Настройте время рассылки. Рассылка запустится автоматически в указанное время.", size=12, color=ft.Colors.GREY),
+                enabled_cb,
+                type_dd,
+                once_row,
+                interval_row,
+                daily_row,
+                next_run_text,
+                ft.Row([ft.Button("Сохранить расписание", icon=ft.Icons.SCHEDULE, on_click=save_schedule)], alignment=ft.MainAxisAlignment.START),
+                status_text,
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
@@ -1866,8 +2223,7 @@ def save_message(text, parse_mode=None, attachments=None, page=None):
         def do_save():
             save_config(cfg)
             def on_done():
-                page.snack_bar = ft.SnackBar(ft.Text("Сохранено"))
-                page.snack_bar.open = True
+                show_notify(page, "Сохранено")
                 page.update()
             _run_on_page(page, on_done)
         threading.Thread(target=do_save, daemon=True).start()
@@ -1935,6 +2291,7 @@ def run_broadcast_thread(page, pb, status_text, counter_text=None):
                 setattr(pb, "visible", False)
                 if counter_text:
                     counter_text.value = f"Готово: {stats['success']} отправлено, {stats['failed']} ошибок"
+                show_notify(page, f"Рассылка завершена: {stats['success']} отправлено, {stats['failed']} ошибок", duration=5000)
                 done_dlg = ft.AlertDialog(
                     modal=True,
                     title=ft.Text("Рассылка завершена"),
@@ -1944,14 +2301,22 @@ def run_broadcast_thread(page, pb, status_text, counter_text=None):
                 page.show_dialog(done_dlg)
                 page.update()
 
-            _run_on_page(page, show_done)
+            def after_done():
+                show_done()
+                try:
+                    from schedule import mark_run
+                    mark_run(load_config() or {})
+                except Exception:
+                    pass
+            _run_on_page(page, after_done)
         except Exception as ex:
             msg = str(ex)
-            _run_on_page(page, lambda m=msg: (
-                setattr(status_text, "value", f"Ошибка: {m}"),
-                setattr(pb, "visible", False),
+            def on_err():
+                status_text.value = f"Ошибка: {msg}"
+                pb.visible = False
+                show_notify(page, f"Ошибка рассылки: {msg}", is_error=True)
                 page.update()
-            ))
+            _run_on_page(page, on_err)
 
     t = threading.Thread(target=run)
     t.start()
@@ -1967,6 +2332,19 @@ def main(page: ft.Page):
     icon_path = _assets_dir / "icon.ico"
     if icon_path.exists():
         page.window.icon = str(icon_path.resolve())
+
+    page.window.prevent_close = True
+    _tray_started = [False]
+
+    def on_window_event(e: ft.WindowEvent):
+        if getattr(e, "type", None) == ft.WindowEventType.CLOSE:
+            page.window.visible = False
+            page.update()
+            if not _tray_started[0]:
+                _tray_started[0] = True
+                run_tray(icon_path, page)
+
+    page.window.on_event = on_window_event
 
     page.theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
     page.dark_theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
@@ -2013,20 +2391,28 @@ def main(page: ft.Page):
         nav_index = [0]
         content_area = ft.Container(expand=True)
 
+        schedule_enabled_ref = [load_config().get("schedule_enabled", False)]
+
         def build_content(idx):
             if idx == 0:
-                return build_accounts_view(p)
+                return build_home_view(p, on_nav)
             if idx == 1:
-                return build_stats_view(p)
+                return build_accounts_view(p)
             if idx == 2:
-                return build_notifications_view(p)
+                return build_stats_view(p)
             if idx == 3:
-                return build_profile_view(p)
+                return build_notifications_view(p)
             if idx == 4:
-                return build_messages_view(p)
+                return build_profile_view(p)
             if idx == 5:
+                return build_messages_view(p)
+            if idx == 6:
+                return build_schedule_view(p, lambda: run_broadcast_thread(p, pb, status_text, counter_text), schedule_enabled_ref)
+            if idx == 7:
                 return build_dm_view(p, status_text, pb, counter_text)
-            return build_chats_view(p, on_refresh=lambda: on_nav(6))
+            if idx == 8:
+                return build_chats_view(p, on_refresh=lambda: on_nav(8))
+            return build_home_view(p, on_nav)
 
         def on_nav(idx):
             nav_index[0] = idx
@@ -2067,6 +2453,13 @@ def main(page: ft.Page):
 
         content_area.content = build_content(0)
         sidebar = build_sidebar(on_nav, 0)
+
+        schedule_stop = threading.Event()
+        def scheduled_callback():
+            def do_run():
+                run_broadcast_thread(p, pb, status_text, counter_text)
+            _run_on_page(p, do_run)
+        run_scheduler(scheduled_callback, schedule_stop)
 
         p.add(
             ft.Row(
