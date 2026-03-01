@@ -24,6 +24,8 @@ a = Analysis(
         "broadcast",
         "chats",
         "core",
+        "dashboard",
+        "errors",
     ],
     hookspath=[],
     hooksconfig={},

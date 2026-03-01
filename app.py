@@ -2,14 +2,15 @@ import asyncio
 import queue
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from tkinter import Tk, filedialog
 
 import flet as ft
 
 from auth import clear_remember, is_remembered, save_remember, verify
-from broadcast import auth_account, create_client, request_code, run_broadcast, sign_in_with_code, substitute_variables
-from chats import extract_links_from_xlsx, run_join_all_links
+from broadcast import auth_account, create_client, request_code, run_broadcast, run_dm_broadcast, sign_in_with_code, substitute_variables
+from chats import extract_links_from_xlsx, run_join_all_links, run_leave_all_chats
 from core import (
     BASE_DIR,
     DATA_DIR,
@@ -29,6 +30,8 @@ from core import (
     MAX_ACCOUNTS,
     SESSIONS_DIR,
 )
+from dashboard import build_error_log_content, get_alerts_grouped
+from errors import ACCORDION_CATEGORIES, get_level_style
 from tdata_import import add_accounts_to_config, import_tdata_folder, open_tdata_folder
 from validate_accounts import validate_all_accounts
 WIDTH = 1100
@@ -50,8 +53,10 @@ def build_sidebar(on_nav, selected_index):
         destinations=[
             ft.NavigationRailDestination(icon=ft.Icons.PEOPLE, label="Аккаунты"),
             ft.NavigationRailDestination(icon=ft.Icons.ANALYTICS, label="Статистика"),
+            ft.NavigationRailDestination(icon=ft.Icons.NOTIFICATIONS, label="Уведомления"),
             ft.NavigationRailDestination(icon=ft.Icons.PERSON, label="Профиль"),
             ft.NavigationRailDestination(icon=ft.Icons.MESSAGE, label="Сообщения"),
+            ft.NavigationRailDestination(icon=ft.Icons.MAIL, label="В личку"),
             ft.NavigationRailDestination(icon=ft.Icons.FORUM, label="Чаты"),
         ],
     )
@@ -270,6 +275,41 @@ def build_accounts_view(page):
         dlg.actions = [ft.TextButton("Закрыть", on_click=on_cancel)]
         p.show_dialog(dlg)
         p.update()
+
+    def clear_accounts_dialog(e):
+        cfg = load_config()
+        count = len((cfg or {}).get("accounts") or [])
+        if count == 0:
+            e.page.snack_bar = ft.SnackBar(ft.Text("Нет аккаунтов для очистки."), bgcolor=ft.Colors.GREY_700)
+            e.page.snack_bar.open = True
+            e.page.update()
+            return
+
+        def confirm_clear(ev):
+            c = load_config() or {}
+            c["accounts"] = []
+            save_config(c)
+            ev.page.pop_dialog()
+            refresh_list()
+            ev.page.snack_bar = ft.SnackBar(ft.Text(f"Удалено {count} аккаунт(ов)."), bgcolor=ft.Colors.PRIMARY_CONTAINER)
+            ev.page.snack_bar.open = True
+            ev.page.update()
+
+        def cancel(ev):
+            ev.page.pop_dialog()
+            ev.page.update()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Очистить все аккаунты?"),
+            content=ft.Text(f"Будет удалено {count} аккаунт(ов) из списка. Сессии авторизации не удаляются."),
+            actions=[
+                ft.TextButton("Отмена", on_click=cancel),
+                ft.Button("Удалить всё", icon=ft.Icons.DELETE, on_click=confirm_clear),
+            ],
+        )
+        e.page.show_dialog(dlg)
+        e.page.update()
 
     def validate_accounts_dialog(e):
         cfg = load_config()
@@ -494,6 +534,7 @@ def build_accounts_view(page):
                             ft.Button("Авторизовать", icon=ft.Icons.LOGIN, on_click=auth_account_dialog),
                             ft.Button("Через tdata", icon=ft.Icons.FOLDER_OPEN, on_click=tdata_auth_dialog),
                             ft.Button("Проверить валидность", icon=ft.Icons.VERIFIED_USER, on_click=validate_accounts_dialog),
+                            ft.OutlinedButton("Очистить аккаунты", icon=ft.Icons.DELETE_SWEEP, on_click=clear_accounts_dialog),
                         ], spacing=8, wrap=True),
                     ],
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -501,6 +542,116 @@ def build_accounts_view(page):
                 ),
                 ft.Divider(),
                 accounts_list,
+            ],
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        padding=20,
+    )
+
+
+def _level_color(level: str):
+    style = get_level_style(level)
+    color_map = {"error": ft.Colors.ERROR, "orange": ft.Colors.ORANGE, "primary": ft.Colors.PRIMARY}
+    return color_map.get(style.color_key, ft.Colors.PRIMARY)
+
+
+def _level_icon(level: str):
+    style = get_level_style(level)
+    icon_map = {"ERROR": ft.Icons.ERROR, "ERROR_OUTLINE": ft.Icons.ERROR_OUTLINE, "WARNING_AMBER": ft.Icons.WARNING_AMBER, "INFO_OUTLINE": ft.Icons.INFO_OUTLINE}
+    return icon_map.get(style.icon_key, ft.Icons.INFO_OUTLINE)
+
+
+def build_notifications_view(page):
+    grouped = get_alerts_grouped(limit=100)
+    category_labels = {c.key: (c.title, c.subtitle) for c in ACCORDION_CATEGORIES.values()}
+    panels = []
+    for cat_key, (title, subtitle) in category_labels.items():
+        items = grouped.get(cat_key) or []
+        content_list = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO)
+        if not items:
+            content_list.controls.append(ft.Text("Нет уведомлений", size=12, color=ft.Colors.GREY, italic=True))
+        else:
+            for a in items:
+                ts = a.get("ts", "")
+                msg = a.get("message", "")
+                details = a.get("details", "")
+                lvl = a.get("level", "info")
+                color = _level_color(lvl)
+                icon = _level_icon(lvl)
+                row = ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Icon(icon, color=color, size=18),
+                            ft.Column(
+                                [
+                                    ft.Text(msg, size=13, weight=ft.FontWeight.W_500),
+                                    ft.Text(details, size=11, color=ft.Colors.GREY_700, overflow=ft.TextOverflow.ELLIPSIS, max_lines=2),
+                                    ft.Text(ts, size=10, color=ft.Colors.GREY_600),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    padding=8,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_LOWEST,
+                    border_radius=6,
+                )
+                content_list.controls.append(row)
+        panel = ft.ExpansionPanel(
+            header=ft.ListTile(
+                title=ft.Text(title, weight=ft.FontWeight.W_600),
+                subtitle=ft.Text(f"{len(items)} уведомлений" if items else "Нет уведомлений"),
+            ),
+            content=ft.Container(content=content_list, height=min(400, 100 + len(items) * 70)),
+        )
+        panels.append(panel)
+    accordion = ft.ExpansionPanelList(
+        expand_icon_color=ft.Colors.PRIMARY,
+        elevation=2,
+        controls=panels,
+    )
+
+    def download_error_log(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Сохранить лог для разработчика",
+            defaultextension=".txt",
+            filetypes=[("Текст", "*.txt"), ("Все файлы", "*.*")],
+            initialfile=f"spammer-bot-errors-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt",
+        )
+        root.destroy()
+        if not path:
+            return
+        try:
+            content = build_error_log_content()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            page.snack_bar = ft.SnackBar(ft.Text(f"Лог сохранён: {path}"))
+            page.snack_bar.open = True
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка: {ex}"), bgcolor=ft.Colors.ERROR_CONTAINER)
+            page.snack_bar.open = True
+        page.update()
+
+    download_btn = ft.OutlinedButton(
+        "Скачать полный лог для разработчика",
+        icon=ft.Icons.DOWNLOAD,
+        on_click=download_error_log,
+    )
+
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Уведомления", size=24, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Text("Классифицированные уведомления о рассылках и ошибках.", size=12, color=ft.Colors.GREY),
+                ft.Row([download_btn], alignment=ft.MainAxisAlignment.START),
+                accordion,
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
@@ -601,6 +752,42 @@ def build_chats_view(page, on_refresh=None):
             links.remove(link)
             save_chat_links(links)
             refresh_links()
+
+    def clear_all_links_dialog(e):
+        links = get_chat_links()
+        count = len(links)
+        if count == 0:
+            page.snack_bar = ft.SnackBar(ft.Text("Нет ссылок для удаления."), bgcolor=ft.Colors.GREY_700)
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        def confirm_clear(ev):
+            save_chat_links([])
+            ev.page.pop_dialog()
+            refresh_links()
+            if on_refresh:
+                on_refresh()
+            status_text.value = f"Удалено {count} ссылок"
+            ev.page.snack_bar = ft.SnackBar(ft.Text(f"Удалено {count} ссылок."), bgcolor=ft.Colors.PRIMARY_CONTAINER)
+            ev.page.snack_bar.open = True
+            ev.page.update()
+
+        def cancel(ev):
+            ev.page.pop_dialog()
+            ev.page.update()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Удалить все ссылки?"),
+            content=ft.Text(f"Будет удалено {count} сохранённых ссылок. Это действие нельзя отменить."),
+            actions=[
+                ft.TextButton("Отмена", on_click=cancel),
+                ft.Button("Удалить всё", icon=ft.Icons.DELETE, on_click=confirm_clear),
+            ],
+        )
+        page.show_dialog(dlg)
+        page.update()
 
     def do_import(e):
         root = Tk()
@@ -739,6 +926,83 @@ def build_chats_view(page, on_refresh=None):
         page.show_dialog(dlg)
         page.update()
 
+    def show_leave_dialog(e):
+        authorized = [a for a in (cfg.get("accounts") or []) if is_account_authorized(a["phone"])]
+        if not authorized:
+            status_text.value = "Нет авторизованных аккаунтов"
+            page.update()
+            return
+        if not cfg.get("api_id") or not cfg.get("api_hash"):
+            status_text.value = "Настройте api_id и api_hash в Профиле"
+            page.update()
+            return
+        confirm_dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Выход из всех чатов"),
+            content=ft.Text(
+                f"Все {len(authorized)} аккаунт(ов) выйдут из всех групп и каналов. "
+                "Избранное (Saved Messages) не затрагивается.\n\nПродолжить?"
+            ),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda ev: (ev.page.pop_dialog(), ev.page.update())),
+                ft.Button("Да, выйти", icon=ft.Icons.EXIT_TO_APP, on_click=lambda ev: _do_leave(ev)),
+            ],
+        )
+        def _do_leave(ev):
+            ev.page.pop_dialog()
+            page.update()
+            counter_text = ft.Text("0 выходов, 0 ошибок", size=14)
+            cancel_event = threading.Event()
+
+            def on_progress(left, failed):
+                def update():
+                    counter_text.value = f"{left} выходов, {failed} ошибок"
+                    page.update()
+                _run_on_page(page, update)
+
+            def on_stop(ev2):
+                cancel_event.set()
+                stop_btn.disabled = True
+                stop_btn.text = "Остановка..."
+                page.update()
+
+            stop_btn = ft.TextButton("Остановить", on_click=on_stop)
+            progress_dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Выход из чатов"),
+                content=ft.Column(
+                    [ft.ProgressBar(visible=True), counter_text],
+                    tight=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                actions=[stop_btn],
+            )
+            page.show_dialog(progress_dlg)
+            page.update()
+
+            def do_leave_thread():
+                try:
+                    results = asyncio.run(run_leave_all_chats(on_progress=on_progress, cancel_event=cancel_event))
+                    total_left = sum(r["left"] for r in results)
+                    total_failed = sum(r["failed"] for r in results)
+                    summary = "\n".join([f"{r['phone']}: вышел из {r['left']}, ошибок {r['failed']}" for r in results])
+                    def done():
+                        page.pop_dialog()
+                        status_text.value = f"Готово. Выходов: {total_left}, ошибок: {total_failed}"
+                        page.snack_bar = ft.SnackBar(ft.Text(summary), duration=5000)
+                        page.snack_bar.open = True
+                        page.update()
+                    _run_on_page(page, done)
+                except Exception as ex:
+                    def err():
+                        page.pop_dialog()
+                        status_text.value = f"Ошибка: {ex}"
+                        page.update()
+                    _run_on_page(page, err)
+            threading.Thread(target=do_leave_thread, daemon=True).start()
+        page.show_dialog(confirm_dlg)
+        page.update()
+
     def do_join(e):
         links = get_chat_links()
         if not links:
@@ -767,9 +1031,12 @@ def build_chats_view(page, on_refresh=None):
                     [
                         ft.Button("Импорт из xlsx", icon=ft.Icons.UPLOAD_FILE, on_click=do_import),
                         ft.Button("Вступить во все", icon=ft.Icons.GROUP_ADD, on_click=do_join),
+                        ft.OutlinedButton("Выйти из всех чатов", icon=ft.Icons.EXIT_TO_APP, on_click=show_leave_dialog),
+                        ft.OutlinedButton("Удалить все ссылки", icon=ft.Icons.DELETE_SWEEP, on_click=clear_all_links_dialog),
                     ],
                     spacing=12,
                     alignment=ft.MainAxisAlignment.START,
+                    wrap=True,
                 ),
                 ft.Row([pb, status_text], spacing=8),
                 ft.Text("Нажмите «Импорт из xlsx» и выберите файл. Скрипт сохраняет только ссылки (t.me/...).", size=12, color=ft.Colors.GREY),
@@ -976,6 +1243,137 @@ def _apply_format_to_selection(msg_field, parse_mode_dd, last_selection_ref, fmt
     except Exception:
         pass
     return True
+
+
+def build_dm_view(page, status_text=None, pb=None, counter_text=None):
+    def run_dm_thread():
+        def run():
+            c = load_config()
+            if not c or not c.get("accounts") or not c.get("message"):
+                def err():
+                    if status_text:
+                        status_text.value = "Ошибка: добавьте аккаунты и сообщение в разделе «Сообщения»"
+                    page.update()
+                _run_on_page(page, err)
+                return
+            links = get_chat_links() or []
+            if not links:
+                def err():
+                    if status_text:
+                        status_text.value = "Нет ссылок в базе. Импортируйте в разделе «Чаты»."
+                    page.update()
+                _run_on_page(page, err)
+                return
+            def get_code(phone_num):
+                _run_on_page(page, lambda ph=phone_num: _show_code_dialog(page, ph))
+                return RESPONSE_QUEUE.get(timeout=120)
+            def start_ui():
+                if status_text:
+                    status_text.value = "Рассылка в личку..."
+                if pb:
+                    pb.visible = True
+                if counter_text:
+                    counter_text.value = "Отправлено: 0, ошибок: 0"
+                page.update()
+            def on_prog(success, failed):
+                def upd():
+                    if counter_text:
+                        counter_text.value = f"Отправлено: {success}, ошибок: {failed}"
+                    page.update()
+                _run_on_page(page, upd)
+            try:
+                _run_on_page(page, start_ui)
+                stats = asyncio.run(run_dm_broadcast(c, code_input=get_code, on_progress=on_prog))
+                def done():
+                    if status_text:
+                        status_text.value = "Рассылка в личку завершена"
+                    if pb:
+                        pb.visible = False
+                    if counter_text:
+                        counter_text.value = f"Готово: {stats['success']} в ЛС, {stats['failed']} ошибок"
+                    dlg = ft.AlertDialog(
+                        modal=True,
+                        title=ft.Text("Рассылка в личку завершена"),
+                        content=ft.Text(f"Отправлено: {stats['success']}\nОшибок: {stats['failed']}"),
+                        actions=[ft.Button("OK", on_click=lambda e: (e.page.pop_dialog(), e.page.update()))],
+                    )
+                    page.show_dialog(dlg)
+                    page.update()
+                _run_on_page(page, done)
+            except Exception as ex:
+                def err():
+                    if status_text:
+                        status_text.value = f"Ошибка: {ex}"
+                    if pb:
+                        pb.visible = False
+                    page.update()
+                _run_on_page(page, err)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_code_dialog(pg, phone):
+        code_field = ft.TextField(label="Код из Telegram", width=300, autofocus=True)
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Код для {phone}"),
+            content=code_field,
+            actions=[],
+        )
+        def on_code_ok(e):
+            RESPONSE_QUEUE.put((code_field.value or "").strip())
+            pg.pop_dialog()
+            pg.update()
+        dlg.actions = [ft.Button("OK", on_click=on_code_ok)]
+        pg.show_dialog(dlg)
+        pg.update()
+
+    def on_start_dm(e):
+        links = get_chat_links() or []
+        if not links:
+            page.snack_bar = ft.SnackBar(ft.Text("Нет ссылок в базе. Импортируйте в разделе «Чаты»."))
+            page.snack_bar.open = True
+            page.update()
+            return
+        acc_count = len([a for a in (load_config() or {}).get("accounts", []) if is_account_authorized(a["phone"])])
+        confirm_dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Рассылка в личку"),
+            content=ft.Text(
+                f"Сообщение будет отправлено в личку каждому участнику всех {len(links)} чатов из базы "
+                f"с {acc_count} аккаунт(ов). Один пользователь получит не более одного сообщения.\n\n"
+                "Вы уверены?"
+            ),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda ev: (ev.page.pop_dialog(), ev.page.update())),
+                ft.Button("Да, запустить", icon=ft.Icons.CHAT, on_click=lambda ev: (
+                    ev.page.pop_dialog(),
+                    ev.page.update(),
+                    run_dm_thread()
+                )),
+            ],
+        )
+        page.show_dialog(confirm_dlg)
+        page.update()
+
+    start_btn = ft.Button("Запустить рассылку в личку", icon=ft.Icons.CHAT, on_click=on_start_dm)
+
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Рассылка в личку участникам", size=24, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Text(
+                    "Сообщение будет отправлено в личку каждому участнику всех чатов из базы (раздел «Чаты»). "
+                    "Текст и вложения берутся из раздела «Сообщения». Дубликаты по одному пользователю исключаются.",
+                    size=12,
+                    color=ft.Colors.GREY,
+                ),
+                ft.Row([start_btn], alignment=ft.MainAxisAlignment.START),
+            ],
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        padding=20,
+    )
 
 
 def build_messages_view(page):
@@ -1270,7 +1668,6 @@ def build_messages_view(page):
 
         mf.on_change = lambda e: update_preview()
         pm_dd.on_change = lambda e: update_preview()
-        # Начальное значение — без update(), т.к. контрол ещё не на странице
         preview_text.value = substitute_variables(mf.value or "", "Пример чата", "+7 900 123-45-67", 150)
         return preview_container
 
@@ -1622,10 +2019,14 @@ def main(page: ft.Page):
             if idx == 1:
                 return build_stats_view(p)
             if idx == 2:
-                return build_profile_view(p)
+                return build_notifications_view(p)
             if idx == 3:
+                return build_profile_view(p)
+            if idx == 4:
                 return build_messages_view(p)
-            return build_chats_view(p, on_refresh=lambda: on_nav(4))
+            if idx == 5:
+                return build_dm_view(p, status_text, pb, counter_text)
+            return build_chats_view(p, on_refresh=lambda: on_nav(6))
 
         def on_nav(idx):
             nav_index[0] = idx

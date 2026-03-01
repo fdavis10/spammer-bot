@@ -1,10 +1,12 @@
 import csv
 import json
+import platform
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from core import DATA_DIR
+from core import DATA_DIR, load_config, CONFIG_PATH
 
 BROADCAST_LOG = DATA_DIR / "broadcast.log"
 ALERTS_FILE = DATA_DIR / "alerts.json"
@@ -78,28 +80,113 @@ def get_dashboard_stats():
     return result
 
 
-def get_alerts(limit=20):
+def get_alerts(limit=200):
     if not ALERTS_FILE.exists():
         return []
     try:
         with open(ALERTS_FILE, encoding="utf-8") as f:
             alerts = json.load(f)
-        return list(alerts)[-limit:][::-1]
+        result = list(alerts)[-limit:][::-1]
+        for a in result:
+            if "category" not in a:
+                a["category"] = _infer_category(a.get("level", ""), a.get("message", ""), a.get("details", ""))
+        return result
     except (json.JSONDecodeError, IOError):
         return []
 
 
-def add_alert(level: str, message: str, details: str = ""):
-    alerts = get_alerts(limit=500)(limit=500)
+def get_alerts_grouped(limit=200):
+    alerts = get_alerts(limit=limit)
+    grouped = {"account": [], "chat": [], "other": []}
+    for a in alerts:
+        cat = a.get("category") or "other"
+        if cat not in grouped:
+            grouped[cat] = []
+        grouped[cat].append(a)
+    return grouped
+
+
+def _infer_category(level: str, message: str, details: str) -> str:
+    combined = (str(message) + " " + str(details)).lower()
+    if level == "critical" or "бан" in combined or "session" in combined or "auth" in combined or "unregister" in combined or "заблокирован" in combined:
+        return "account"
+    if "чат" in combined or "групп" in combined or "channel" in combined or "participant" in combined or "peer" in combined or " -> " in details:
+        return "chat"
+    return "other"
+
+
+def add_alert(level: str, message: str, details: str = "", category: str = None):
+    alerts = get_alerts(limit=500)
+    cat = category or _infer_category(level, message, details)
     alerts.append({
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "level": level,
         "message": message,
         "details": details,
+        "category": cat,
     })
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(ALERTS_FILE, "w", encoding="utf-8") as f:
         json.dump(alerts[-200:], f, ensure_ascii=False, indent=0)
+
+
+def build_error_log_content() -> str:
+    lines = []
+    lines.append("=" * 60)
+    lines.append("SPAMMER BOT — ПОЛНЫЙ ЛОГ ДЛЯ РАЗРАБОТЧИКА")
+    lines.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append("--- СИСТЕМА ---")
+    lines.append(f"Python: {sys.version}")
+    lines.append(f"Платформа: {platform.platform()}")
+    lines.append(f"Frozen (exe): {getattr(sys, 'frozen', False)}")
+    lines.append("")
+    lines.append("--- УВЕДОМЛЕНИЯ (alerts) ---")
+    alerts = get_alerts(limit=500)
+    if not alerts:
+        lines.append("(нет)")
+    else:
+        for a in alerts:
+            lines.append(f"  [{a.get('level', '')}] {a.get('message', '')}")
+            if a.get("details"):
+                lines.append(f"    {a['details']}")
+            lines.append(f"    {a.get('ts', '')}")
+    lines.append("")
+    lines.append("--- ЛОГ РАССЫЛКИ (broadcast.log) ---")
+    if BROADCAST_LOG.exists():
+        with open(BROADCAST_LOG, encoding="utf-8") as f:
+            log_lines = f.readlines()
+        for line in log_lines[-500:]:
+            lines.append(line.rstrip())
+    else:
+        lines.append("(файл не найден)")
+    lines.append("")
+    lines.append("--- КОНФИГ (без паролей и api_hash) ---")
+    cfg = load_config()
+    if cfg:
+        safe = {}
+        for k, v in cfg.items():
+            if k == "accounts":
+                safe[k] = [{"phone": a.get("phone", ""), "proxy": bool(a.get("proxy"))} for a in (v or [])]
+            elif k == "api_hash":
+                safe[k] = "(скрыто)"
+            else:
+                safe[k] = v
+        lines.append(json.dumps(safe, ensure_ascii=False, indent=2))
+    else:
+        lines.append("(конфиг не найден)")
+    lines.append("")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def add_alert_from_error(alert_error):
+    from errors import AlertError
+    if isinstance(alert_error, AlertError):
+        d = alert_error.to_dict()
+        d["ts"] = d["ts"] or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        add_alert(d["level"], d["message"], d["details"], d["category"])
 
 
 def export_report_csv(filepath: str) -> int:

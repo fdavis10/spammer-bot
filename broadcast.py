@@ -7,7 +7,7 @@ from typing import Callable, Optional
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat, User
 
-from core import load_config as _load_cfg, SESSIONS_DIR, DATA_DIR
+from core import load_config as _load_cfg, SESSIONS_DIR, DATA_DIR, is_account_authorized, get_chat_links
 
 DATA_DIR.mkdir(exist_ok=True)
 BROADCAST_LOG = DATA_DIR / "broadcast.log"
@@ -269,18 +269,31 @@ async def send_from_account(client, phone, message, stats, config=None, parse_mo
                     try:
                         from dashboard import add_alert
                         err_l = err_str.lower()
-                        if "flood" in err_l or "wait" in err_l:
-                            add_alert("warning", "FloodWait", f"{phone} -> {chat_name}: {err_str}")
-                        elif "auth" in err_l or "session" in err_l or "unregister" in err_l:
-                            add_alert("critical", "Бан/сессия", f"{phone}: {err_str}")
+                        if "auth" in err_l or "session" in err_l or "unregister" in err_l or "ban" in err_l or "заблокирован" in err_str.lower():
+                            add_alert("critical", "Аккаунт заблокирован/сессия", f"{phone}: {err_str}", category="account")
+                        elif "channel" in err_l or "chat" in err_l or "participant" in err_l or "peer" in err_l:
+                            add_alert("warning", "Не удалось отправить в чат", f"{phone} -> {chat_name}: {err_str}", category="chat")
+                        elif "flood" in err_l or "wait" in err_l:
+                            add_alert("warning", "FloodWait", f"{phone} -> {chat_name}: {err_str}", category="other")
                         elif "connection" in err_l or "timeout" in err_l:
-                            add_alert("error", "Сетевая ошибка", f"{phone}: {err_str}")
+                            add_alert("error", "Сетевая ошибка", f"{phone}: {err_str}", category="other")
+                        else:
+                            add_alert("error", "Ошибка отправки", f"{phone} -> {chat_name}: {err_str}", category="other")
                     except Exception:
                         pass
                 if delay_sec > 0 and i < len(chats) - 1:
                     await asyncio.sleep(delay_sec)
     except Exception as e:
         _log_send("ОШИБКА", phone, "(критическая)", str(e))
+        try:
+            from dashboard import add_alert
+            err_s = str(e).lower()
+            if "auth" in err_s or "session" in err_s or "unregister" in err_s or "ban" in err_s:
+                add_alert("critical", "Аккаунт заблокирован", f"{phone}: {e}", category="account")
+            else:
+                add_alert("error", "Критическая ошибка аккаунта", f"{phone}: {e}", category="account")
+        except Exception:
+            pass
     finally:
         await client.disconnect()
 
@@ -351,6 +364,146 @@ async def run_broadcast(config, code_input=None, on_progress: Optional[Callable[
             add_alert("warning", "Рассылка завершена с ошибками", f"{stats['success']} отправлено, {stats['failed']} ошибок")
         else:
             add_alert("info", "Рассылка завершена", f"{stats['success']} отправлено, {stats['failed']} ошибок")
+    except Exception:
+        pass
+    return stats
+
+
+async def _send_dm_to_users(client, phone, users, message, parse_mode, attachments, stats, config, on_progress, stats_lock):
+    delay_sec = max(0, float(config.get("message_delay_sec") or 2))
+    use_variables = config.get("use_variables", True)
+    max_retries = int(config.get("max_retries") or MAX_RETRIES)
+    files = attachments or []
+    for i, u in enumerate(users):
+        if hasattr(u, "bot") and u.bot:
+            continue
+        if hasattr(u, "deleted") and u.deleted:
+            continue
+        user_name = getattr(u, "first_name", "") or getattr(u, "username", "") or str(getattr(u, "id", ""))
+        if use_variables:
+            text = substitute_variables(message or "", user_name, phone, 1)
+        else:
+            text = message or ""
+        ok, err = await _send_one_with_retry(client, u, text, parse_mode, files, phone, user_name, max_retries)
+        if ok:
+            _log_send("ОТПРАВЛЕНО (ЛС)", phone, user_name)
+            if stats_lock:
+                async with stats_lock:
+                    stats["success"] += 1
+                    if on_progress:
+                        on_progress(stats["success"], stats["failed"])
+            else:
+                stats["success"] += 1
+                if on_progress:
+                    on_progress(stats["success"], stats["failed"])
+        else:
+            _log_send("ОШИБКА (ЛС)", phone, user_name, str(err))
+            if stats_lock:
+                async with stats_lock:
+                    stats["failed"] += 1
+                    if on_progress:
+                        on_progress(stats["success"], stats["failed"])
+            else:
+                stats["failed"] += 1
+                if on_progress:
+                    on_progress(stats["success"], stats["failed"])
+        if delay_sec > 0 and i < len(users) - 1:
+            await asyncio.sleep(delay_sec)
+
+
+async def run_dm_broadcast(config, code_input=None, on_progress: Optional[Callable[[int, int], None]] = None):
+    links = [l for l in (get_chat_links() or []) if l and str(l).strip()]
+    if not links:
+        raise ValueError("Нет ссылок на чаты в базе. Импортируйте ссылки в разделе «Чаты».")
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    api_id = config["api_id"]
+    api_hash = config["api_hash"]
+    accounts = [a for a in config["accounts"] if is_account_authorized(a["phone"])]
+    if not accounts:
+        raise ValueError("Нет авторизованных аккаунтов")
+    message = config.get("message", "")
+    parse_mode = config.get("parse_mode") or None
+    _raw = config.get("attachments") or []
+    attachments = [str(Path(p).resolve()) for p in _raw if Path(p).exists()]
+    dm_config = {
+        "message_delay_sec": config.get("message_delay_sec"),
+        "use_variables": config.get("use_variables", True),
+        "max_retries": config.get("max_retries", MAX_RETRIES),
+    }
+    stats = {"success": 0, "failed": 0}
+
+    def _on_progress(s, f):
+        stats["success"] = s
+        stats["failed"] = f
+        if on_progress:
+            on_progress(s, f)
+
+    clients_data = []
+    for acc in accounts:
+        phone = acc["phone"]
+        session_name = SESSIONS_DIR / phone.replace("+", "").replace(" ", "")
+        proxy = acc.get("proxy") or config.get("proxy")
+        client = create_client(session_name, api_id, api_hash, proxy)
+        clients_data.append((client, phone, acc.get("password", "")))
+
+    for client, phone, password in clients_data:
+        try:
+            await auth_account(client, phone, password, code_input=code_input)
+        except Exception:
+            raise
+        await asyncio.sleep(LOGIN_DELAY)
+
+    stats_lock = asyncio.Lock()
+
+    async def _dm_task(client, phone, password):
+        try:
+            await client.connect()
+            me = await client.get_me()
+            seen_ids = set()
+            for link in links:
+                try:
+                    entity = await client.get_entity(link)
+                    users_in_chat = []
+                    async for u in client.iter_participants(entity):
+                        if isinstance(u, User) and not getattr(u, "bot", False) and not getattr(u, "deleted", False):
+                            if u.id != me.id and u.id not in seen_ids:
+                                seen_ids.add(u.id)
+                                users_in_chat.append(u)
+                    if users_in_chat:
+                        await _send_dm_to_users(
+                            client, phone, users_in_chat, message, parse_mode, attachments,
+                            stats, dm_config, _on_progress, stats_lock
+                        )
+                except Exception as ex:
+                    _log_send("ОШИБКА (ЛС)", phone, f"чат {link}", str(ex))
+                    try:
+                        from dashboard import add_alert
+                        add_alert("warning", "Не удалось получить участников чата", f"{phone} -> {link}: {ex}", category="chat")
+                    except Exception:
+                        pass
+        except Exception as e:
+            _log_send("ОШИБКА (ЛС)", phone, "(критическая)", str(e))
+            try:
+                from dashboard import add_alert
+                err_s = str(e).lower()
+                if "auth" in err_s or "session" in err_s or "unregister" in err_s or "ban" in err_s:
+                    add_alert("critical", "Аккаунт заблокирован", f"{phone}: {e}", category="account")
+                else:
+                    add_alert("error", "Критическая ошибка аккаунта", f"{phone}: {e}", category="account")
+            except Exception:
+                pass
+        finally:
+            await client.disconnect()
+
+    await asyncio.gather(*[_dm_task(c, ph, pw) for c, ph, pw in clients_data])
+
+    done_line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | --- ЛС: {stats['success']} отправлено, {stats['failed']} ошибок ---"
+    with open(BROADCAST_LOG, "a", encoding="utf-8") as f:
+        f.write(done_line + "\n")
+    print(done_line)
+    try:
+        from dashboard import add_alert
+        add_alert("info", "Рассылка в личку завершена", f"{stats['success']} отправлено, {stats['failed']} ошибок")
     except Exception:
         pass
     return stats

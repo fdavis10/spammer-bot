@@ -124,7 +124,7 @@ def add_accounts_to_config(phones: list[str]) -> None:
         if normalized.isdigit():
             ph = f"+{normalized}" if not p.startswith("+") else p
         else:
-            ph = p  # id_12345
+            ph = p
         key = ph.replace("+", "").replace(" ", "")
         if key not in existing:
             cfg["accounts"].append({"phone": ph, "password": ""})
@@ -133,7 +133,7 @@ def add_accounts_to_config(phones: list[str]) -> None:
 
 
 def open_tdata_folder() -> None:
-    TDATA_IMPORT_DIR.mkdir(parents=True, exist_ok=True)(parents=True, exist_ok=True)
+    TDATA_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = str(TDATA_IMPORT_DIR.resolve())
     if os.name == "nt":
         os.startfile(path)
