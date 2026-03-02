@@ -713,7 +713,7 @@ def _level_icon(level: str):
 
 
 def build_notifications_view(page):
-    grouped = get_alerts_grouped(limit=100)
+    grouped = get_alerts_grouped(limit=50)
     category_labels = {c.key: (c.title, c.subtitle) for c in ACCORDION_CATEGORIES.values()}
     panels = []
     for cat_key, (title, subtitle) in category_labels.items():
@@ -923,10 +923,22 @@ def build_chats_view(page, on_refresh=None):
     status_text = ft.Text("", size=12, color=ft.Colors.GREY)
     links_list = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=4)
     pb = ft.ProgressBar(visible=False)
+    _search_timer = [None]
+
+    def _debounced_refresh(e):
+        t = _search_timer[0]
+        if t and t.is_alive():
+            t.cancel()
+        def run():
+            _run_on_page(page, refresh_links)
+        _search_timer[0] = threading.Timer(0.25, run)
+        _search_timer[0].daemon = True
+        _search_timer[0].start()
+
     search_field = ft.TextField(
         hint_text="Поиск по ссылке...",
         width=320,
-        on_change=lambda e: refresh_links(),
+        on_change=_debounced_refresh,
     )
 
     MAX_LINKS_DISPLAY = 10
@@ -2534,7 +2546,7 @@ def main(page: ft.Page):
         p.add(
             ft.Row(
                 [
-                    ft.Container(content=sidebar, padding=ft.padding.only(left=12, top=12, bottom=12)),
+                    ft.Container(content=sidebar, padding=ft.Padding(left=12, top=12, bottom=12)),
                     ft.VerticalDivider(width=1),
                     ft.Column(
                         [

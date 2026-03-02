@@ -49,17 +49,35 @@ def _migrate_sessions():
             shutil.copy2(f, dst)
 
 
+_config_cache = {}
+_config_cache_mtime = 0
+
 def load_config():
+    global _config_cache_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else 0
+        if mtime == _config_cache_mtime and _config_cache:
+            return _config_cache.get("cfg")
+    except OSError:
+        pass
     if not CONFIG_PATH.exists():
+        _config_cache_mtime = 0
+        _config_cache.clear()
         return None
     with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    _config_cache_mtime = CONFIG_PATH.stat().st_mtime
+    _config_cache["cfg"] = cfg
+    return cfg
 
 
 def save_config(cfg):
+    global _config_cache_mtime
     DATA_DIR.mkdir(exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=4)
+    _config_cache_mtime = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else 0
+    _config_cache["cfg"] = cfg
 
 
 def is_account_authorized(phone):
@@ -120,21 +138,41 @@ def _normalize_link(link: str) -> str:
     return s.strip("/") or ""
 
 
+_joined_chats_cache = {}
+_joined_chats_mtime = 0
+
 def _load_joined_chats() -> dict:
+    global _joined_chats_mtime
+    try:
+        mtime = JOINED_CHATS_PATH.stat().st_mtime if JOINED_CHATS_PATH.exists() else 0
+        if mtime and mtime == _joined_chats_mtime:
+            return _joined_chats_cache
+    except OSError:
+        pass
     if not JOINED_CHATS_PATH.exists():
+        _joined_chats_cache.clear()
+        _joined_chats_mtime = 0
         return {}
     try:
         with open(JOINED_CHATS_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        result = data if isinstance(data, dict) else {}
+        _joined_chats_cache.clear()
+        _joined_chats_cache.update(result)
+        _joined_chats_mtime = JOINED_CHATS_PATH.stat().st_mtime
+        return _joined_chats_cache
     except (json.JSONDecodeError, IOError):
         return {}
 
 
 def _save_joined_chats(data: dict) -> None:
+    global _joined_chats_mtime
     DATA_DIR.mkdir(exist_ok=True)
     with open(JOINED_CHATS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=0)
+    _joined_chats_cache.clear()
+    _joined_chats_cache.update(data)
+    _joined_chats_mtime = JOINED_CHATS_PATH.stat().st_mtime
 
 
 def get_joined_links(phone: str) -> set[str]:
@@ -285,21 +323,39 @@ def _migrate_chat_links():
     save_config(cfg)
 
 
+_chat_links_cache = []
+_chat_links_mtime = 0
+
 def get_chat_links():
+    global _chat_links_mtime
+    try:
+        mtime = CHAT_LINKS_PATH.stat().st_mtime if CHAT_LINKS_PATH.exists() else 0
+        if mtime and mtime == _chat_links_mtime:
+            return _chat_links_cache
+    except OSError:
+        pass
     if not CHAT_LINKS_PATH.exists():
+        _chat_links_cache.clear()
+        _chat_links_mtime = 0
         return []
     try:
         with open(CHAT_LINKS_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        _chat_links_cache[:] = data if isinstance(data, list) else []
+        _chat_links_mtime = CHAT_LINKS_PATH.stat().st_mtime
+        return _chat_links_cache
     except (json.JSONDecodeError, IOError):
         return []
 
 
 def save_chat_links(links: list[str]):
+    global _chat_links_mtime
     DATA_DIR.mkdir(exist_ok=True)
     cleaned = list(dict.fromkeys(str(l).strip() for l in links if l and str(l).strip()))
     with open(CHAT_LINKS_PATH, "w", encoding="utf-8") as f:
         json.dump(cleaned, f, ensure_ascii=False, indent=0)
+    _chat_links_cache[:] = cleaned
+    _chat_links_mtime = CHAT_LINKS_PATH.stat().st_mtime if CHAT_LINKS_PATH.exists() else 0
 
 
 def add_chat_links(new_links: list[str]):
