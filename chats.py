@@ -10,7 +10,17 @@ from telethon.tl.functions.messages import ImportChatInviteRequest, DeleteChatUs
 from telethon.tl.types import Channel, Chat, User
 
 from broadcast import create_client
-from core import SESSIONS_DIR, load_config, is_account_authorized, add_chat_links, get_chat_links
+from core import (
+    SESSIONS_DIR,
+    load_config,
+    is_account_authorized,
+    add_chat_links,
+    get_chat_links,
+    get_joined_links,
+    add_joined_links,
+    clear_joined_for_account,
+    _normalize_link,
+)
 
 LINK_PATTERN = re.compile(
     r'(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/([a-zA-Z0-9_+/-]+)',
@@ -40,6 +50,25 @@ def extract_links_from_xlsx(filepath: str) -> list[str]:
     return list(links)
 
 
+_USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{3,30}[a-zA-Z0-9]$")
+
+
+def _is_valid_telegram_username(username: str) -> bool:
+    if not username or len(username) < 5 or len(username) > 32:
+        return False
+    return bool(_USERNAME_RE.match(username))
+
+
+def _is_permanent_link_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return (
+        "no user has" in m
+        or "nobody is using this username" in m
+        or "cannot cast inputpeeruser to inputchannel" in m
+        or "cannot find any entity" in m
+    )
+
+
 def _parse_link(link: str) -> tuple[str | None, str | None]:
     link = str(link).strip()
     m = re.search(r't\.me/joinchat/([a-zA-Z0-9_-]+)', link, re.I)
@@ -61,6 +90,33 @@ async def join_by_link(client: TelegramClient, link: str) -> tuple[bool, str]:
     link_type, value = _parse_link(link)
     if not value:
         return False, "Неверный формат ссылки"
+
+    if link_type == "username":
+        if not _is_valid_telegram_username(value):
+            return False, "Недопустимый формат юзернейма (5-32 символа, буквы/цифры/подчёркивание)"
+        try:
+            entity = await client.get_entity(value)
+            if isinstance(entity, User):
+                return False, "Ссылка ведёт на пользователя, а не на канал/группу"
+            if isinstance(entity, (Channel, Chat)):
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        await client(JoinChannelRequest(entity))
+                        return True, "OK"
+                    except InviteRequestSentError:
+                        return True, "Заявка подана (ожидает одобрения)"
+                    except FloodWaitError as e:
+                        if e.seconds <= 60 and attempt < max_retries - 1:
+                            await asyncio.sleep(e.seconds)
+                        else:
+                            return False, f"FLOODWAIT:{e.seconds}"
+                    except Exception as e:
+                        return False, str(e)
+                return False, "Ошибка после повторов"
+        except Exception as e:
+            return False, str(e)
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -72,30 +128,56 @@ async def join_by_link(client: TelegramClient, link: str) -> tuple[bool, str]:
         except InviteRequestSentError:
             return True, "Заявка подана (ожидает одобрения)"
         except FloodWaitError as e:
-            if attempt < max_retries - 1:
+            if e.seconds <= 60 and attempt < max_retries - 1:
                 await asyncio.sleep(e.seconds)
             else:
-                return False, f"FloodWait: ждать {e.seconds} сек"
+                return False, f"FLOODWAIT:{e.seconds}"
         except Exception as e:
             return False, str(e)
     return False, "Ошибка после повторов"
 
 
 async def join_links_from_account(
-    client: TelegramClient, phone: str, links: list[str], on_progress=None, cancel_event=None
+    client: TelegramClient,
+    phone: str,
+    links: list[str],
+    on_progress=None,
+    cancel_event=None,
+    invalid_links: set | None = None,
 ) -> dict:
+    import time
+    invalid_links = invalid_links or set()
+    already_joined = get_joined_links(phone)
+    links_to_try = [l for l in links if _normalize_link(l) not in already_joined]
     joined = 0
     failed = 0
     errors = []
-    for link in links:
+    last_progress_time = [0.0]
+    newly_joined = []
+    for link in links_to_try:
         if cancel_event and cancel_event.is_set():
             break
+        norm = _normalize_link(link)
+        if norm in invalid_links:
+            continue
         success, msg = await join_by_link(client, link)
+        if not success and _is_permanent_link_error(msg):
+            invalid_links.add(norm)
         if success:
             joined += 1
+            newly_joined.append(link)
         else:
             failed += 1
             errors.append((link, msg))
+            m = re.search(r"FLOODWAIT:(\d+)", str(msg or ""))
+            if m:
+                sec = int(m.group(1))
+                if newly_joined:
+                    add_joined_links(phone, newly_joined)
+                    newly_joined = []
+                if on_progress:
+                    on_progress(joined, failed)
+                return {"joined": joined, "failed": failed, "errors": errors, "flood_wait_seconds": sec}
             try:
                 from dashboard import add_alert
                 err_l = (msg or "").lower()
@@ -105,10 +187,17 @@ async def join_links_from_account(
                     add_alert("warning", "Не удалось вступить в чат", f"{phone} -> {link}: {msg}", category="chat")
             except Exception:
                 pass
-        if on_progress:
+        now = time.monotonic()
+        if on_progress and (now - last_progress_time[0] >= 1.0):
+            last_progress_time[0] = now
             on_progress(joined, failed)
-        await asyncio.sleep(3)
-    return {"joined": joined, "failed": failed, "errors": errors}
+        await asyncio.sleep(2)
+    if newly_joined:
+        add_joined_links(phone, newly_joined)
+    if on_progress:
+        on_progress(joined, failed)
+    skipped = len(links) - len(links_to_try)
+    return {"joined": joined, "failed": failed, "errors": errors, "skipped": skipped}
 
 
 async def run_join_all_links(links: list[str], on_progress=None, cancel_event=None) -> list[dict]:
@@ -121,6 +210,7 @@ async def run_join_all_links(links: list[str], on_progress=None, cancel_event=No
         raise ValueError("Нет авторизованных аккаунтов")
 
     account_stats = {}
+    invalid_links: set[str] = set()
 
     async def join_for_account(acc: dict):
         phone = acc["phone"]
@@ -141,7 +231,10 @@ async def run_join_all_links(links: list[str], on_progress=None, cancel_event=No
                     total_f = sum(s["failed"] for s in account_stats.values())
                     on_progress(total_j, total_f)
 
-            r = await join_links_from_account(client, phone, links, on_progress=acc_progress, cancel_event=cancel_event)
+            r = await join_links_from_account(
+                client, phone, links,
+                on_progress=acc_progress, cancel_event=cancel_event, invalid_links=invalid_links
+            )
             return {"phone": phone, **r}
         except Exception as e:
             return {"phone": phone, "joined": 0, "failed": len(links), "errors": [("", str(e))]}
@@ -223,6 +316,7 @@ async def run_leave_all_chats(on_progress=None, cancel_event=None) -> list[dict]
                     on_progress(total_l, total_f)
 
             r = await leave_all_chats_from_account(client, phone, on_progress=acc_progress, cancel_event=cancel_event)
+            clear_joined_for_account(phone)
             return {"phone": phone, **r}
         except Exception as e:
             return {"phone": phone, "left": 0, "failed": 0, "errors": [("", str(e))]}

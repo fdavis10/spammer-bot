@@ -7,7 +7,14 @@ from typing import Callable, Optional
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat, User
 
-from core import load_config as _load_cfg, SESSIONS_DIR, DATA_DIR, is_account_authorized, get_chat_links
+from core import (
+    load_config as _load_cfg,
+    SESSIONS_DIR,
+    DATA_DIR,
+    is_account_authorized,
+    get_chat_links,
+    add_sent_message_link,
+)
 
 DATA_DIR.mkdir(exist_ok=True)
 BROADCAST_LOG = DATA_DIR / "broadcast.log"
@@ -18,6 +25,20 @@ MAX_RETRIES = 3
 RETRY_DELAY_SEC = 2
 
 VARIABLE_PATTERN = re.compile(r"\{([^}]+)\}")
+
+
+def _message_link(msg, entity) -> str | None:
+    if not msg or not hasattr(msg, "id"):
+        return None
+    if isinstance(entity, Channel):
+        username = getattr(entity, "username", None) or ""
+        if username:
+            return f"https://t.me/{username}/{msg.id}"
+        cid = entity.id
+        if cid < 0:
+            cid = int(str(cid).replace("-100", ""))
+        return f"https://t.me/c/{cid}/{msg.id}"
+    return None
 
 
 def _log_send(prefix, phone, chat_name, extra=""):
@@ -103,40 +124,6 @@ async def _get_participants_count(client, entity):
     return 0
 
 
-def _name_matches(name: str, patterns: list) -> bool:
-    if not patterns:
-        return False
-    name_lower = (name or "").lower()
-    return any(p and p.strip().lower() in name_lower for p in patterns if p)
-
-
-def _chat_matches_filters(dialog, filters: dict) -> bool:
-    if not filters:
-        return True
-    name = (dialog.name or "").strip()
-    inc = filters.get("include_by_name") or []
-    exc = filters.get("exclude_by_name") or []
-    for pattern in exc:
-        if pattern and pattern.strip().lower() in (name or "").lower():
-            return False
-    if inc:
-        if not _name_matches(name, inc):
-            return False
-    return True
-
-
-def _chat_in_blacklist(name: str, blacklist: list) -> bool:
-    if not blacklist:
-        return False
-    return _name_matches(name, blacklist)
-
-
-def _chat_in_whitelist(name: str, whitelist: list) -> bool:
-    if not whitelist:
-        return True
-    return _name_matches(name, whitelist)
-
-
 async def get_chats(client, config: dict):
     chats = []
     async for d in client.iter_dialogs():
@@ -144,39 +131,7 @@ async def get_chats(client, config: dict):
             chats.append(d)
         elif isinstance(d.entity, User) and d.is_user and d.entity.is_self:
             chats.append(d)
-
-    test_mode = config.get("test_mode") or "off"
-    if test_mode == "self":
-        return [type("_MeDialog", (), {"entity": "me", "name": "Избранное"})()]
-
-    test_chat_name = (config.get("test_chat_name") or "").strip()
-    if test_mode == "single_chat" and test_chat_name:
-        filtered = [d for d in chats if test_chat_name.lower() in (d.name or "").lower()]
-        return filtered[:1] if filtered else []
-
-    chat_filter = config.get("chat_filter") or {}
-    blacklist = config.get("blacklist") or []
-    whitelist = config.get("whitelist") or []
-    min_p = chat_filter.get("min_participants") or 0
-    max_p = chat_filter.get("max_participants") or 0
-
-    result = []
-    for d in chats:
-        name = d.name or ""
-        if _chat_in_blacklist(name, blacklist):
-            continue
-        if not _chat_in_whitelist(name, whitelist):
-            continue
-        if not _chat_matches_filters(d, chat_filter):
-            continue
-        if min_p > 0 or max_p > 0:
-            cnt = await _get_participants_count(client, d.entity)
-            if min_p > 0 and cnt < min_p:
-                continue
-            if max_p > 0 and cnt > max_p:
-                continue
-        result.append(d)
-    return result
+    return chats
 
 
 async def request_code(client, phone):
@@ -203,15 +158,44 @@ async def auth_account(client, phone, password, code_input=None):
     await client.disconnect()
 
 
+async def check_premium_status(config) -> int:
+    from core import set_account_premium
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    api_id = config.get("api_id") or 0
+    api_hash = config.get("api_hash") or ""
+    accounts = [a for a in (config.get("accounts") or []) if is_account_authorized(a.get("phone", ""))]
+    if not accounts or not api_id or not api_hash:
+        return 0
+    updated = 0
+    for acc in accounts:
+        phone = acc["phone"]
+        session_name = SESSIONS_DIR / phone.replace("+", "").replace(" ", "")
+        proxy = acc.get("proxy") or config.get("proxy")
+        client = create_client(session_name, api_id, api_hash, proxy)
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                premium = bool(getattr(me, "premium", False))
+                set_account_premium(phone, premium)
+                updated += 1
+        except Exception:
+            pass
+        finally:
+            await client.disconnect()
+        await asyncio.sleep(LOGIN_DELAY)
+    return updated
+
+
 async def _send_one_with_retry(client, entity, text, parse_mode, files, phone, chat_name, max_retries=MAX_RETRIES):
     last_err = None
     for attempt in range(max_retries):
         try:
             if files:
-                await client.send_file(entity, files, caption=text or None, parse_mode=parse_mode)
+                msg = await client.send_file(entity, files, caption=text or None, parse_mode=parse_mode)
             else:
-                await client.send_message(entity, text, parse_mode=parse_mode)
-            return True, None
+                msg = await client.send_message(entity, text, parse_mode=parse_mode)
+            return True, None, msg
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
@@ -220,7 +204,7 @@ async def _send_one_with_retry(client, entity, text, parse_mode, files, phone, c
                     await asyncio.sleep(RETRY_DELAY_SEC * (attempt + 1))
                     continue
             break
-    return False, last_err
+    return False, last_err, None
 
 
 async def send_from_account(client, phone, message, stats, config=None, parse_mode=None, attachments=None, on_progress=None, stats_lock=None):
@@ -228,6 +212,7 @@ async def send_from_account(client, phone, message, stats, config=None, parse_mo
     delay_sec = max(0, float(config.get("message_delay_sec") or 2))
     use_variables = config.get("use_variables", True)
     max_retries = int(config.get("max_retries") or MAX_RETRIES)
+    messages_per_chat = max(1, int(config.get("messages_per_chat_per_account") or 1))
 
     try:
         await client.connect()
@@ -242,45 +227,56 @@ async def send_from_account(client, phone, message, stats, config=None, parse_mo
                 if use_variables and ("{" in (message or "")):
                     participants_count = await _get_participants_count(client, d.entity) if d.entity != "me" else 0
                 text = substitute_variables(message or "", chat_name, phone, participants_count) if use_variables else (message or "")
-                ok, err = await _send_one_with_retry(client, d.entity, text, parse_mode, files, phone, chat_name, max_retries)
-                if ok:
-                    _log_send("ОТПРАВЛЕНО", phone, chat_name)
-                    if stats_lock:
-                        async with stats_lock:
+
+                for msg_num in range(messages_per_chat):
+                    ok, err, sent_msg = await _send_one_with_retry(client, d.entity, text, parse_mode, files, phone, chat_name, max_retries)
+                    if ok:
+                        _log_send("ОТПРАВЛЕНО", phone, chat_name)
+                        try:
+                            link = _message_link(sent_msg, d.entity)
+                            if link:
+                                add_sent_message_link(phone, link)
+                        except Exception:
+                            pass
+                        if stats_lock:
+                            async with stats_lock:
+                                stats["success"] += 1
+                                if on_progress:
+                                    on_progress(stats["success"], stats["failed"])
+                        else:
                             stats["success"] += 1
                             if on_progress:
                                 on_progress(stats["success"], stats["failed"])
                     else:
-                        stats["success"] += 1
-                        if on_progress:
-                            on_progress(stats["success"], stats["failed"])
-                else:
-                    err_str = str(err)
-                    _log_send("ОШИБКА", phone, chat_name, err_str)
-                    if stats_lock:
-                        async with stats_lock:
+                        err_str = str(err)
+                        _log_send("ОШИБКА", phone, chat_name, err_str)
+                        if stats_lock:
+                            async with stats_lock:
+                                stats["failed"] += 1
+                                if on_progress:
+                                    on_progress(stats["success"], stats["failed"])
+                        else:
                             stats["failed"] += 1
                             if on_progress:
                                 on_progress(stats["success"], stats["failed"])
-                    else:
-                        stats["failed"] += 1
-                        if on_progress:
-                            on_progress(stats["success"], stats["failed"])
-                    try:
-                        from dashboard import add_alert
-                        err_l = err_str.lower()
-                        if "auth" in err_l or "session" in err_l or "unregister" in err_l or "ban" in err_l or "заблокирован" in err_str.lower():
-                            add_alert("critical", "Аккаунт заблокирован/сессия", f"{phone}: {err_str}", category="account")
-                        elif "channel" in err_l or "chat" in err_l or "participant" in err_l or "peer" in err_l:
-                            add_alert("warning", "Не удалось отправить в чат", f"{phone} -> {chat_name}: {err_str}", category="chat")
-                        elif "flood" in err_l or "wait" in err_l:
-                            add_alert("warning", "FloodWait", f"{phone} -> {chat_name}: {err_str}", category="other")
-                        elif "connection" in err_l or "timeout" in err_l:
-                            add_alert("error", "Сетевая ошибка", f"{phone}: {err_str}", category="other")
-                        else:
-                            add_alert("error", "Ошибка отправки", f"{phone} -> {chat_name}: {err_str}", category="other")
-                    except Exception:
-                        pass
+                        try:
+                            from dashboard import add_alert
+                            err_l = err_str.lower()
+                            if "auth" in err_l or "session" in err_l or "unregister" in err_l or "ban" in err_l or "заблокирован" in err_str.lower():
+                                add_alert("critical", "Аккаунт заблокирован/сессия", f"{phone}: {err_str}", category="account")
+                            elif "channel" in err_l or "chat" in err_l or "participant" in err_l or "peer" in err_l:
+                                add_alert("warning", "Не удалось отправить в чат", f"{phone} -> {chat_name}: {err_str}", category="chat")
+                            elif "flood" in err_l or "wait" in err_l:
+                                add_alert("warning", "FloodWait", f"{phone} -> {chat_name}: {err_str}", category="other")
+                            elif "connection" in err_l or "timeout" in err_l:
+                                add_alert("error", "Сетевая ошибка", f"{phone}: {err_str}", category="other")
+                            else:
+                                add_alert("error", "Ошибка отправки", f"{phone} -> {chat_name}: {err_str}", category="other")
+                        except Exception:
+                            pass
+                    if delay_sec > 0 and msg_num < messages_per_chat - 1:
+                        await asyncio.sleep(delay_sec)
+
                 if delay_sec > 0 and i < len(chats) - 1:
                     await asyncio.sleep(delay_sec)
     except Exception as e:
@@ -310,11 +306,7 @@ async def run_broadcast(config, code_input=None, on_progress: Optional[Callable[
 
     broadcast_config = {
         "message_delay_sec": config.get("message_delay_sec"),
-        "test_mode": config.get("test_mode"),
-        "test_chat_name": config.get("test_chat_name"),
-        "chat_filter": config.get("chat_filter"),
-        "blacklist": config.get("blacklist"),
-        "whitelist": config.get("whitelist"),
+        "messages_per_chat_per_account": max(1, int(config.get("messages_per_chat_per_account") or 1)),
         "use_variables": config.get("use_variables", True),
         "max_retries": config.get("max_retries", MAX_RETRIES),
     }
@@ -384,7 +376,7 @@ async def _send_dm_to_users(client, phone, users, message, parse_mode, attachmen
             text = substitute_variables(message or "", user_name, phone, 1)
         else:
             text = message or ""
-        ok, err = await _send_one_with_retry(client, u, text, parse_mode, files, phone, user_name, max_retries)
+        ok, err, _ = await _send_one_with_retry(client, u, text, parse_mode, files, phone, user_name, max_retries)
         if ok:
             _log_send("ОТПРАВЛЕНО (ЛС)", phone, user_name)
             if stats_lock:

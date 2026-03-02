@@ -3,11 +3,12 @@ import re
 from typing import Callable, Optional
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 from broadcast import create_client
-from core import SESSIONS_DIR, load_config, is_account_authorized
+from core import SESSIONS_DIR, load_config, is_account_authorized, set_account_premium
 
 
 def _parse_link(link: str) -> tuple[str | None, str | None]:
@@ -35,6 +36,8 @@ async def _join_group(client: TelegramClient, link: str) -> tuple[bool, str, obj
             await client(JoinChannelRequest(value))
             entity = await client.get_entity(value)
         return True, "OK", entity
+    except FloodWaitError as e:
+        return False, f"FLOODWAIT:{e.seconds}", None
     except Exception as e:
         return False, str(e), None
 
@@ -67,8 +70,15 @@ async def validate_one_account(
         await client.connect()
         if not await client.is_user_authorized():
             return False, "Не авторизован"
+        try:
+            me = await client.get_me()
+            set_account_premium(phone, bool(getattr(me, "premium", False)))
+        except Exception:
+            pass
         ok, msg, entity = await _join_group(client, test_link)
         if not ok:
+            if msg and msg.startswith("FLOODWAIT:"):
+                raise ValueError(msg)
             return False, f"Вступление: {msg}"
         try:
             await client.send_message(entity, test_message or "Тест")
@@ -108,6 +118,10 @@ async def validate_all_accounts(
                 phone, test_link, test_message or "Тест",
                 cfg["api_id"], cfg["api_hash"], proxy
             )
+        except ValueError as e:
+            if str(e).startswith("FLOODWAIT:"):
+                raise
+            success, msg = False, str(e)
         except Exception as e:
             success, msg = False, str(e)
         results.append({"phone": phone, "valid": success, "message": msg})

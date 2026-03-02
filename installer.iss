@@ -1,5 +1,5 @@
 #define MyAppName "Spammer Bot"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "Spammer Bot"
 #define MyAppExeName "SpammerBot.exe"
 #define MyAppAssocName "Spammer Bot"

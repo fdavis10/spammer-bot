@@ -35,27 +35,29 @@ def show_notify(page, message: str, is_error: bool = False, duration: int = 3000
     cfg = load_config() or {}
     if cfg.get("notify_toast", True):
         bg = ft.Colors.ERROR_CONTAINER if is_error else ft.Colors.PRIMARY_CONTAINER
-        page.snack_bar = ft.SnackBar(ft.Text(message), bgcolor=bg, duration=duration)
-        page.snack_bar.open = True
+        snack = ft.SnackBar(ft.Text(message), bgcolor=bg, duration=duration)
+        page.show_dialog(snack)
     if cfg.get("notify_sound", True):
         _play_notify_sound()
     page.update()
 
 from ai_generate import generate_vacancy_text
 from auth import clear_remember, is_remembered, save_remember, verify
-from broadcast import auth_account, create_client, request_code, run_broadcast, run_dm_broadcast, sign_in_with_code, substitute_variables
+from broadcast import auth_account, check_premium_status, create_client, request_code, run_broadcast, run_dm_broadcast, sign_in_with_code, substitute_variables
 from chats import extract_links_from_xlsx, run_join_all_links, run_leave_all_chats
 from core import (
     BASE_DIR,
     DATA_DIR,
     TDATA_IMPORT_DIR,
     add_chat_links,
+    export_joined_chats_to_xlsx,
+    export_sent_message_links_to_xlsx,
+    get_join_stats,
     get_stats,
     add_file_to_storage,
     add_template,
     delete_template,
     get_chat_links,
-    get_stats,
     get_templates,
     is_account_authorized,
     load_config,
@@ -72,8 +74,8 @@ from tdata_import import add_accounts_to_config, import_tdata_folder, open_tdata
 from updater import check_for_updates
 from validate_accounts import validate_all_accounts
 from version import APP_VERSION
-WIDTH = 1100
-HEIGHT = 700
+WIDTH = 1400
+HEIGHT = 850
 RESPONSE_QUEUE = queue.Queue()
 
 
@@ -82,24 +84,22 @@ def build_sidebar(on_nav, selected_index):
         selected_index=selected_index,
         on_change=lambda e: on_nav(e.control.selected_index),
         label_type=ft.NavigationRailLabelType.ALL,
-        min_width=80,
-        min_extended_width=200,
+        min_width=90,
+        min_extended_width=240,
         destinations=[
             ft.NavigationRailDestination(icon=ft.Icons.HOME, label="Главная"),
             ft.NavigationRailDestination(icon=ft.Icons.PEOPLE, label="Аккаунты"),
-            ft.NavigationRailDestination(icon=ft.Icons.ANALYTICS, label="Статистика"),
             ft.NavigationRailDestination(icon=ft.Icons.NOTIFICATIONS, label="Уведомления"),
             ft.NavigationRailDestination(icon=ft.Icons.PERSON, label="Профиль"),
             ft.NavigationRailDestination(icon=ft.Icons.MESSAGE, label="Сообщения"),
             ft.NavigationRailDestination(icon=ft.Icons.SCHEDULE, label="Расписание"),
-            ft.NavigationRailDestination(icon=ft.Icons.MAIL, label="В личку"),
             ft.NavigationRailDestination(icon=ft.Icons.FORUM, label="Чаты"),
+            ft.NavigationRailDestination(icon=ft.Icons.FILE_DOWNLOAD, label="Экспорты"),
         ],
     )
 
 
 def build_home_view(page, on_nav):
-    stats = get_stats()
     cfg = load_config() or {}
     accounts = cfg.get("accounts") or []
     accounts_count = len(accounts)
@@ -109,114 +109,63 @@ def build_home_view(page, on_nav):
     next_run = get_next_run(cfg)
     next_run_str = next_run.strftime("%d.%m.%Y %H:%M") if next_run else "—"
 
-    total = stats["total_sent"] + stats["total_failed"]
-    sent_pct = (stats["total_sent"] / total * 100) if total else 50
-    failed_pct = (stats["total_failed"] / total * 100) if total else 50
-
-    if total > 0:
-        bar_w = 200
-        sw = max(8, int(bar_w * sent_pct / 100))
-        fw = max(8, int(bar_w * failed_pct / 100))
-        chart_row = ft.Column(
-            [
-                ft.Row(
-                    [
-                        ft.Text("Отправлено / Ошибок", size=12, weight=ft.FontWeight.W_500),
-                        ft.Text(f"{stats['total_sent']} / {stats['total_failed']}", size=12, color=ft.Colors.GREY),
-                    ],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                ),
-                ft.Container(
-                    content=ft.Row(
-                        [
-                            ft.Container(width=sw, height=24, bgcolor=ft.Colors.GREEN, border_radius=4),
-                            ft.Container(width=fw, height=24, bgcolor=ft.Colors.ERROR, border_radius=4),
-                        ],
-                        spacing=2,
-                    ),
-                ),
-            ],
-            spacing=4,
-        )
-    else:
-        chart_row = ft.Text("Нет данных рассылки", size=12, color=ft.Colors.GREY)
-
-    last_lines = (stats.get("last_lines") or [])[-5:][::-1]
-    last_activity = ft.Column(
-        [ft.Text(ln[:70] + ("..." if len(ln) > 70 else ""), size=11, color=ft.Colors.ON_SURFACE_VARIANT) for ln in last_lines] if last_lines else [ft.Text("—", size=12, color=ft.Colors.GREY)],
-        spacing=2,
-    )
-
     def _card(title, value, icon, color=ft.Colors.PRIMARY, on_click=None):
         c = ft.Container(
             content=ft.Column(
                 [
-                    ft.Icon(icon, color=color, size=28),
-                    ft.Text(str(value), size=24, weight=ft.FontWeight.BOLD),
-                    ft.Text(title, size=12, color=ft.Colors.GREY),
+                    ft.Icon(icon, color=color, size=36),
+                    ft.Text(str(value), size=28, weight=ft.FontWeight.BOLD),
+                    ft.Text(title, size=13, color=ft.Colors.GREY),
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=4,
+                spacing=6,
             ),
-            padding=20,
-            width=140,
-            border_radius=12,
+            padding=24,
+            width=180,
+            border_radius=14,
             bgcolor=ft.Colors.SURFACE_CONTAINER,
         )
         if on_click:
             return ft.GestureDetector(content=ft.Card(content=c), on_tap=lambda e: on_nav(on_click))
         return ft.Card(content=c)
 
-    return ft.Container(
+    result = ft.Container(
         content=ft.Column(
             [
-                ft.Text("Обзор", size=20, weight=ft.FontWeight.BOLD),
-                ft.Divider(height=1),
+                ft.Text("Обзор", size=26, weight=ft.FontWeight.BOLD),
+                ft.Divider(height=2),
                 ft.Row(
                     [
-                        _card("Отправлено", stats["total_sent"], ft.Icons.CHECK_CIRCLE, ft.Colors.GREEN, 2),
-                        _card("Ошибок", stats["total_failed"], ft.Icons.ERROR, ft.Colors.ERROR, 2),
                         _card("Аккаунтов", f"{auth_count}/{accounts_count}", ft.Icons.PEOPLE, ft.Colors.PRIMARY, 1),
-                        _card("Чатов", chats_count, ft.Icons.FORUM, ft.Colors.TEAL, 8),
-                        _card("Шаблонов", templates_count, ft.Icons.BOOKMARK, ft.Colors.AMBER, 5),
+                        _card("Чатов", chats_count, ft.Icons.FORUM, ft.Colors.TEAL, 6),
+                        _card("Шаблонов", templates_count, ft.Icons.BOOKMARK, ft.Colors.AMBER, 4),
                     ],
-                    spacing=12,
+                    spacing=20,
                     wrap=True,
                 ),
-                ft.Container(height=12),
-                ft.Text("Рассылка: успех / ошибки", size=14, weight=ft.FontWeight.W_500),
-                chart_row,
-                ft.Container(height=12),
+                ft.Container(height=20),
                 ft.Row(
                     [
                         ft.Column(
                             [
-                                ft.Text("Следующая рассылка", size=14, weight=ft.FontWeight.W_500),
-                                ft.Text(next_run_str, size=12, color=ft.Colors.GREY),
+                                ft.Text("Следующая рассылка", size=16, weight=ft.FontWeight.W_500),
+                                ft.Text(next_run_str, size=13, color=ft.Colors.GREY),
                             ],
-                            spacing=2,
+                            spacing=4,
                             expand=True,
                         ),
-                        ft.TextButton("Расписание →", on_click=lambda e: on_nav(6)),
+                        ft.TextButton("Расписание →", on_click=lambda e: on_nav(5)),
                     ],
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 ),
-                ft.Container(height=12),
-                ft.Text("Последняя активность", size=14, weight=ft.FontWeight.W_500),
-                ft.Container(
-                    content=last_activity,
-                    padding=12,
-                    bgcolor=ft.Colors.SURFACE_CONTAINER,
-                    border_radius=8,
-                ),
-                ft.TextButton("Вся статистика →", on_click=lambda e: on_nav(2)),
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
-            spacing=8,
+            spacing=12,
         ),
-        padding=20,
+        padding=28,
     )
+    return (result, None)
 
 
 def build_accounts_view(page):
@@ -234,6 +183,7 @@ def build_accounts_view(page):
             for i, acc in enumerate(cfg["accounts"]):
                 is_auth = is_account_authorized(acc["phone"])
                 is_valid = acc.get("validated", False)
+                is_premium = acc.get("premium", False)
                 proxy_tag = ft.Text("Прокси", size=10, color=ft.Colors.TEAL) if acc.get("proxy") else ft.Container()
                 valid_tag = ft.Text("Валидный", size=10, color=ft.Colors.GREEN) if is_valid else ft.Container()
                 accounts_list.controls.append(
@@ -246,6 +196,7 @@ def build_accounts_view(page):
                                             ft.Icon(ft.Icons.PHONE_ANDROID, color=ft.Colors.BLUE),
                                             ft.Icon(ft.Icons.CHECK_CIRCLE, color=ft.Colors.GREEN, size=20) if is_auth else ft.Container(width=20),
                                             ft.Icon(ft.Icons.VERIFIED_USER, color=ft.Colors.TEAL, size=18) if is_valid else ft.Container(width=18),
+                                            ft.Icon(ft.Icons.STAR, color=ft.Colors.AMBER, size=18, tooltip="Premium") if is_premium else ft.Container(width=18),
                                         ],
                                         spacing=4,
                                     ),
@@ -466,6 +417,24 @@ def build_accounts_view(page):
         e.page.show_dialog(dlg)
         e.page.update()
 
+    def check_premium_click(e):
+        cfg = load_config()
+        if not cfg or not cfg.get("api_id") or not cfg.get("api_hash"):
+            show_notify(page, "Настройте api_id и api_hash в Профиле", is_error=True)
+            return
+        auth_count = len([a for a in (cfg.get("accounts") or []) if is_account_authorized(a.get("phone", ""))])
+        if not auth_count:
+            show_notify(page, "Нет авторизованных аккаунтов", is_error=True)
+            return
+        show_notify(page, "Проверка Premium...")
+        def run():
+            try:
+                n = asyncio.run(check_premium_status(cfg))
+                _run_on_page(page, lambda: (refresh_list(), show_notify(page, f"Обновлено: {n} аккаунт(ов)")))
+            except Exception as ex:
+                _run_on_page(page, lambda: show_notify(page, f"Ошибка: {ex}", is_error=True))
+        threading.Thread(target=run, daemon=True).start()
+
     def validate_accounts_dialog(e):
         cfg = load_config()
         if not cfg or not cfg.get("api_id") or not cfg.get("api_hash"):
@@ -548,6 +517,33 @@ def build_accounts_view(page):
                         show_notify(p, f"Проверка валидности: {v_count} валидных, {f_count} ошибок", duration=5000)
                         p.update()
                     _run_on_page(p, done)
+                except ValueError as ex:
+                    if str(ex).startswith("FLOODWAIT:"):
+                        import re
+                        m = re.search(r"FLOODWAIT:(\d+)", str(ex))
+                        sec = int(m.group(1)) if m else 60
+                        from datetime import datetime, timedelta
+                        until = datetime.now() + timedelta(seconds=sec)
+                        until_str = until.strftime("%H:%M")
+                        def flood_done():
+                            run_btn.visible = True
+                            progress_bar.visible = False
+                            counter_text.value = f"Остановлено: ограничение до {until_str}"
+                            show_notify(p, f"Подождите до {until_str} (~{sec // 60} мин), затем можно продолжить", duration=6000)
+                            refresh_list()
+                            p.update()
+                            def remind():
+                                _run_on_page(p, lambda: show_notify(p, "Ограничение снято. Можно продолжить проверку валидности.", duration=5000))
+                            threading.Timer(sec, remind).start()
+                        _run_on_page(p, flood_done)
+                        return
+                    def err():
+                        run_btn.visible = True
+                        progress_bar.visible = False
+                        counter_text.value = f"Ошибка: {ex}"
+                        show_notify(p, f"Ошибка проверки: {ex}", is_error=True)
+                        p.update()
+                    _run_on_page(p, err)
                 except Exception as ex:
                     def err():
                         run_btn.visible = True
@@ -675,9 +671,7 @@ def build_accounts_view(page):
         page.show_dialog(dlg)
         page.update()
 
-    refresh_list()
-
-    return ft.Container(
+    c = ft.Container(
         content=ft.Column(
             [
                 ft.Row(
@@ -688,6 +682,7 @@ def build_accounts_view(page):
                             ft.Button("Авторизовать", icon=ft.Icons.LOGIN, on_click=auth_account_dialog),
                             ft.Button("Через tdata", icon=ft.Icons.FOLDER_OPEN, on_click=tdata_auth_dialog),
                             ft.Button("Проверить валидность", icon=ft.Icons.VERIFIED_USER, on_click=validate_accounts_dialog),
+                            ft.Button("Проверить Premium", icon=ft.Icons.STAR, on_click=check_premium_click),
                             ft.OutlinedButton("Очистить аккаунты", icon=ft.Icons.DELETE_SWEEP, on_click=clear_accounts_dialog),
                         ], spacing=8, wrap=True),
                     ],
@@ -702,6 +697,7 @@ def build_accounts_view(page):
         ),
         padding=20,
     )
+    return (c, refresh_list)
 
 
 def _level_color(level: str):
@@ -768,7 +764,86 @@ def build_notifications_view(page):
         controls=panels,
     )
 
-    def download_error_log(e):
+    stats = get_stats()
+    sent_counter_text = ft.Text(str(stats["total_sent"]), size=28, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN)
+    sent_counter_card = ft.Card(
+        content=ft.Container(
+            ft.Column([
+                ft.Text("Отправлено сообщений", size=14, color=ft.Colors.GREY),
+                sent_counter_text,
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=24, width=200,
+        ),
+    )
+
+    def refresh_sent_counter():
+        s = get_stats()
+        sent_counter_text.value = str(s["total_sent"])
+        page.update()
+
+    c = ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Уведомления", size=24, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Row([sent_counter_card], alignment=ft.MainAxisAlignment.START),
+                ft.Text("Классифицированные уведомления о рассылках и ошибках.", size=12, color=ft.Colors.GREY),
+                accordion,
+            ],
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        padding=20,
+    )
+    return (c, refresh_sent_counter)
+
+
+def build_exports_view(page):
+    import json as _json
+
+    def do_export_joined(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Сохранить экспорт вступлений",
+            defaultextension=".xlsx",
+            filetypes=[("Excel файлы", "*.xlsx"), ("Все файлы", "*.*")],
+        )
+        root.destroy()
+        if not path:
+            return
+        try:
+            export_joined_chats_to_xlsx(path)
+            show_notify(page, f"Экспорт сохранён: {path}")
+        except ValueError as ex:
+            show_notify(page, str(ex), is_error=True)
+        except Exception as ex:
+            show_notify(page, f"Ошибка экспорта: {ex}", is_error=True)
+        page.update()
+
+    def do_export_message_links(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Сохранить экспорт ссылок на сообщения",
+            defaultextension=".xlsx",
+            filetypes=[("Excel файлы", "*.xlsx"), ("Все файлы", "*.*")],
+        )
+        root.destroy()
+        if not path:
+            return
+        try:
+            export_sent_message_links_to_xlsx(path)
+            show_notify(page, f"Экспорт сохранён: {path}")
+        except ValueError as ex:
+            show_notify(page, str(ex), is_error=True)
+        except Exception as ex:
+            show_notify(page, f"Ошибка экспорта: {ex}", is_error=True)
+        page.update()
+
+    def do_export_error_log(e):
         root = Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -790,75 +865,61 @@ def build_notifications_view(page):
             show_notify(page, f"Ошибка: {ex}", is_error=True)
         page.update()
 
-    download_btn = ft.OutlinedButton(
-        "Скачать полный лог для разработчика",
-        icon=ft.Icons.DOWNLOAD,
-        on_click=download_error_log,
-    )
+    def do_export_settings(e):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Экспорт настроек",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+            initialfile="spammer-bot-config-backup.json",
+        )
+        root.destroy()
+        if not path:
+            return
+        try:
+            c = load_config()
+            if not c:
+                show_notify(page, "Нет настроек для экспорта", is_error=True)
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    _json.dump(c, f, ensure_ascii=False, indent=2)
+                show_notify(page, f"Настройки экспортированы: {path}")
+        except Exception as ex:
+            show_notify(page, f"Ошибка: {ex}", is_error=True)
+        page.update()
 
-    return ft.Container(
+    c = ft.Container(
         content=ft.Column(
             [
-                ft.Text("Уведомления", size=24, weight=ft.FontWeight.BOLD),
+                ft.Text("Экспорты", size=26, weight=ft.FontWeight.BOLD),
                 ft.Divider(),
-                ft.Text("Классифицированные уведомления о рассылках и ошибках.", size=12, color=ft.Colors.GREY),
-                ft.Row([download_btn], alignment=ft.MainAxisAlignment.START),
-                accordion,
-            ],
-            expand=True,
-            scroll=ft.ScrollMode.AUTO,
-        ),
-        padding=20,
-    )
-
-
-def build_stats_view(page):
-    stats = get_stats()
-    rows = [ft.DataRow(cells=[ft.DataCell(ft.Text(line[:80] + "..." if len(line) > 80 else line))]) for line in stats["last_lines"][-20:][::-1]]
-    return ft.Container(
-        content=ft.Column(
-            [
-                ft.Text("Статистика", size=24, weight=ft.FontWeight.BOLD),
-                ft.Divider(),
+                ft.Text("Все экспорты данных в одном месте.", size=12, color=ft.Colors.GREY),
+                ft.Container(height=16),
                 ft.Row(
                     [
-                        ft.Card(
-                            content=ft.Container(
-                                ft.Column([
-                                    ft.Text("Отправлено", size=14, color=ft.Colors.GREY),
-                                    ft.Text(str(stats["total_sent"]), size=32, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN),
-                                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                                padding=24, width=160,
-                            ),
-                        ),
-                        ft.Card(
-                            content=ft.Container(
-                                ft.Column([
-                                    ft.Text("Ошибок", size=14, color=ft.Colors.GREY),
-                                    ft.Text(str(stats["total_failed"]), size=32, weight=ft.FontWeight.BOLD, color=ft.Colors.RED),
-                                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                                padding=24, width=160,
-                            ),
-                        ),
+                        ft.OutlinedButton("Экспорт вступлений (xlsx)", icon=ft.Icons.DOWNLOAD, on_click=do_export_joined),
+                        ft.OutlinedButton("Экспорт ссылок на сообщения (xlsx)", icon=ft.Icons.LINK, on_click=do_export_message_links),
+                        ft.OutlinedButton("Скачать лог для разработчика (txt)", icon=ft.Icons.DOWNLOAD, on_click=do_export_error_log),
+                        ft.OutlinedButton("Экспорт настроек (json)", icon=ft.Icons.SETTINGS_BACKUP_RESTORE, on_click=do_export_settings),
                     ],
-                    spacing=16,
-                ),
-                ft.Text("Последние записи лога", size=16, weight=ft.FontWeight.W_500),
-                ft.Container(
-                    content=ft.DataTable(columns=[ft.DataColumn(ft.Text("Лог"))], rows=rows or [ft.DataRow(cells=[ft.DataCell(ft.Text("—"))])]),
-                    border=ft.Border.all(1, ft.Colors.OUTLINE),
-                    border_radius=8,
+                    spacing=12,
+                    wrap=True,
+                    alignment=ft.MainAxisAlignment.START,
                 ),
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
         ),
-        padding=20,
+        padding=28,
     )
+    return (c, None)
 
 
 def build_chats_view(page, on_refresh=None):
     cfg = load_config()
+    join_stats_text = ft.Text(f"Всего вступлений: {get_join_stats()}", size=16, weight=ft.FontWeight.W_500, color=ft.Colors.TEAL)
     status_text = ft.Text("", size=12, color=ft.Colors.GREY)
     links_list = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=4)
     pb = ft.ProgressBar(visible=False)
@@ -896,6 +957,7 @@ def build_chats_view(page, on_refresh=None):
                 )
             if len(links) > limit:
                 links_list.controls.append(ft.Text(f"Показано {limit} из {len(links)}", size=12, color=ft.Colors.GREY))
+        join_stats_text.value = f"Всего вступлений: {get_join_stats()}"
         page.update()
 
     def _delete_link(link):
@@ -1043,24 +1105,86 @@ def build_chats_view(page, on_refresh=None):
             page.update()
 
             def do_join_thread():
-                try:
-                    results = asyncio.run(run_join_all_links(links, on_progress=on_progress, cancel_event=cancel_event))
+                from datetime import datetime, timedelta
+                import time as _time
+
+                total_joined_all = 0
+                total_failed_all = 0
+                total_skipped_all = 0
+
+                while not cancel_event.is_set():
+                    try:
+                        results = asyncio.run(
+                            run_join_all_links(links, on_progress=on_progress, cancel_event=cancel_event)
+                        )
+                    except Exception as ex:
+                        def err():
+                            page.pop_dialog()
+                            status_text.value = f"Ошибка: {ex}"
+                            show_notify(page, f"Ошибка: {ex}", is_error=True)
+                            page.update()
+                        _run_on_page(page, err)
+                        return
+
+                    flood_sec = max((r.get("flood_wait_seconds", 0) for r in results), default=0)
                     total_joined = sum(r["joined"] for r in results)
                     total_failed = sum(r["failed"] for r in results)
-                    summary = "\n".join([f"{r['phone']}: вступил в {r['joined']}, ошибок {r['failed']}" for r in results])
+                    total_skipped = sum(r.get("skipped", 0) for r in results)
+
+                    total_joined_all += total_joined
+                    total_failed_all += total_failed
+                    total_skipped_all += total_skipped
+
+                    if flood_sec > 0 and not cancel_event.is_set():
+                        until = datetime.now() + timedelta(seconds=flood_sec)
+                        until_str = until.strftime("%H:%M")
+
+                        def pause_msg():
+                            status_text.value = (
+                                f"Пауза: Telegram ограничение. Продолжим автоматически около {until_str} "
+                                f"(~{flood_sec // 60} мин). Уже вступлений: {total_joined_all}, ошибок: {total_failed_all}"
+                            )
+                            show_notify(
+                                page,
+                                f"Лимит Telegram. Продолжим автоматически около {until_str}. "
+                                f"Уже вступлений: {total_joined_all}.",
+                                duration=6000,
+                            )
+                            page.update()
+                        _run_on_page(page, pause_msg)
+
+                        waited = 0
+                        while waited < flood_sec and not cancel_event.is_set():
+                            _time.sleep(1)
+                            waited += 1
+
+                        if cancel_event.is_set():
+                            def stopped():
+                                page.pop_dialog()
+                                status_text.value = "Остановлено пользователем."
+                                page.update()
+                            _run_on_page(page, stopped)
+                            return
+
+                        continue
+
+                    lines = [
+                        f"Готово. Вступлений за сессию: {total_joined_all}, "
+                        f"пропущено (уже в чате): {total_skipped_all}, ошибок: {total_failed_all}"
+                    ]
+                    for r in results:
+                        skipped = r.get("skipped", 0)
+                        extra = f", пропущено {skipped}" if skipped else ""
+                        lines.append(f"• {r['phone']}: вступил в {r['joined']} групп{extra}")
+
                     def done():
                         page.pop_dialog()
-                        status_text.value = f"Готово. Вступлений: {total_joined}, ошибок: {total_failed}"
-                        show_notify(page, summary, duration=5000)
+                        status_text.value = "\n".join(lines)
+                        join_stats_text.value = f"Всего вступлений: {get_join_stats()}"
+                        show_notify(page, lines[0], duration=4000)
                         page.update()
                     _run_on_page(page, done)
-                except Exception as ex:
-                    def err():
-                        page.pop_dialog()
-                        status_text.value = f"Ошибка: {ex}"
-                        show_notify(page, f"Ошибка: {ex}", is_error=True)
-                        page.update()
-                    _run_on_page(page, err)
+                    return
 
             threading.Thread(target=do_join_thread, daemon=True).start()
 
@@ -1170,12 +1294,11 @@ def build_chats_view(page, on_refresh=None):
             return
         show_join_dialog(links)
 
-    refresh_links()
-
-    return ft.Container(
+    c = ft.Container(
         content=ft.Column(
             [
-                ft.Text("Чаты", size=24, weight=ft.FontWeight.BOLD),
+                ft.Text("Чаты", size=26, weight=ft.FontWeight.BOLD),
+                ft.Row([join_stats_text], alignment=ft.MainAxisAlignment.START),
                 ft.Divider(),
                 ft.Row(
                     [
@@ -1197,8 +1320,9 @@ def build_chats_view(page, on_refresh=None):
             expand=True,
             scroll=ft.ScrollMode.AUTO,
         ),
-        padding=20,
+        padding=28,
     )
+    return (c, refresh_links)
 
 
 def _do_check_updates(e, page, update_url_field):
@@ -1295,31 +1419,6 @@ def build_profile_view(page):
         save_config(c)
         show_notify(page, "Сохранено")
 
-    def do_export(e):
-        root = Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        path = filedialog.asksaveasfilename(
-            title="Экспорт настроек",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
-            initialfile="spammer-bot-config-backup.json",
-        )
-        root.destroy()
-        if not path:
-            return
-        try:
-            c = load_config()
-            if not c:
-                show_notify(page, "Нет настроек для экспорта", is_error=True)
-            else:
-                with open(path, "w", encoding="utf-8") as f:
-                    _json.dump(c, f, ensure_ascii=False, indent=2)
-                show_notify(page, f"Настройки экспортированы: {path}")
-        except Exception as ex:
-            show_notify(page, f"Ошибка: {ex}", is_error=True)
-        page.update()
-
     def do_import(e):
         root = Tk()
         root.withdraw()
@@ -1379,25 +1478,27 @@ def build_profile_view(page):
         p.show_dialog(dlg)
         p.update()
 
-    return ft.Container(
+    c = ft.Container(
         content=ft.Column(
             [
-                ft.Text("Профиль", size=24, weight=ft.FontWeight.BOLD),
+                ft.Text("Профиль", size=26, weight=ft.FontWeight.BOLD),
                 ft.Divider(),
                 ft.Row([ft.Text("Тема:"), theme_dd], alignment=ft.MainAxisAlignment.START),
                 ft.Divider(),
                 ft.Text("Уведомления", size=16, weight=ft.FontWeight.W_600),
                 ft.Row([notify_toast_cb, notify_sound_cb], spacing=24),
                 ft.Row([notify_sound_field, ft.Button("Выбрать файл", icon=ft.Icons.AUDIO_FILE, on_click=pick_sound_file)], spacing=8),
-                ft.Button("Применить", icon=ft.Icons.NOTIFICATIONS_ACTIVE, on_click=save_notify_settings),
+                ft.Row([
+                    ft.Button("Применить", icon=ft.Icons.NOTIFICATIONS_ACTIVE, on_click=save_notify_settings),
+                    ft.OutlinedButton("Вывести тестовый тост", icon=ft.Icons.NOTIFICATIONS, on_click=lambda e: show_notify(e.page, "Пример уведомления. Ограничение снято. Можно продолжить.", duration=5000)),
+                ], spacing=12),
                 ft.Divider(),
                 ft.Text("API Telegram (https://my.telegram.org)", size=14),
                 ft.Row([api_id_field, api_hash_field], spacing=12),
                 ft.Button("Сохранить API", on_click=save_api),
                 ft.Divider(),
-                ft.Text("Экспорт / Импорт настроек", size=16, weight=ft.FontWeight.W_600),
+                ft.Text("Импорт настроек", size=16, weight=ft.FontWeight.W_600),
                 ft.Row([
-                    ft.Button("Экспорт настроек", icon=ft.Icons.UPLOAD_FILE, on_click=do_export),
                     ft.Button("Импорт настроек", icon=ft.Icons.DOWNLOAD, on_click=do_import),
                 ], spacing=12),
                 ft.Divider(),
@@ -1419,8 +1520,9 @@ def build_profile_view(page):
             expand=True,
             scroll=ft.ScrollMode.AUTO,
         ),
-        padding=20,
+        padding=28,
     )
+    return (c, None)
 
 
 def _store_selection(e, last_selection_ref):
@@ -1470,14 +1572,17 @@ def _apply_format_to_selection(msg_field, parse_mode_dd, last_selection_ref, fmt
     return True
 
 
-def build_dm_view(page, status_text=None, pb=None, counter_text=None):
+def build_messages_view(page, status_text=None, pb=None, counter_text=None):
+    cfg = load_config() or {}
+    last_selection = [None]
+
     def run_dm_thread():
         def run():
             c = load_config()
             if not c or not c.get("accounts") or not c.get("message"):
                 def err():
                     if status_text:
-                        status_text.value = "Ошибка: добавьте аккаунты и сообщение в разделе «Сообщения»"
+                        status_text.value = "Ошибка: добавьте аккаунты и сообщение"
                     page.update()
                 _run_on_page(page, err)
                 return
@@ -1490,7 +1595,7 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
                 _run_on_page(page, err)
                 return
             def get_code(phone_num):
-                _run_on_page(page, lambda ph=phone_num: _show_code_dialog(page, ph))
+                _run_on_page(page, lambda ph=phone_num: _show_dm_code_dialog(page, ph))
                 return RESPONSE_QUEUE.get(timeout=120)
             def start_ui():
                 if status_text:
@@ -1517,13 +1622,6 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
                     if counter_text:
                         counter_text.value = f"Готово: {stats['success']} в ЛС, {stats['failed']} ошибок"
                     show_notify(page, f"Рассылка в личку: {stats['success']} отправлено, {stats['failed']} ошибок", duration=5000)
-                    dlg = ft.AlertDialog(
-                        modal=True,
-                        title=ft.Text("Рассылка в личку завершена"),
-                        content=ft.Text(f"Отправлено: {stats['success']}\nОшибок: {stats['failed']}"),
-                        actions=[ft.Button("OK", on_click=lambda e: (e.page.pop_dialog(), e.page.update()))],
-                    )
-                    page.show_dialog(dlg)
                     page.update()
                 _run_on_page(page, done)
             except Exception as ex:
@@ -1537,7 +1635,7 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
                 _run_on_page(page, err)
         threading.Thread(target=run, daemon=True).start()
 
-    def _show_code_dialog(pg, phone):
+    def _show_dm_code_dialog(pg, phone):
         code_field = ft.TextField(label="Код из Telegram", width=300, autofocus=True)
         dlg = ft.AlertDialog(
             modal=True,
@@ -1579,31 +1677,7 @@ def build_dm_view(page, status_text=None, pb=None, counter_text=None):
         page.show_dialog(confirm_dlg)
         page.update()
 
-    start_btn = ft.Button("Запустить рассылку в личку", icon=ft.Icons.CHAT, on_click=on_start_dm)
-
-    return ft.Container(
-        content=ft.Column(
-            [
-                ft.Text("Рассылка в личку участникам", size=24, weight=ft.FontWeight.BOLD),
-                ft.Divider(),
-                ft.Text(
-                    "Сообщение будет отправлено в личку каждому участнику всех чатов из базы (раздел «Чаты»). "
-                    "Текст и вложения берутся из раздела «Сообщения». Дубликаты по одному пользователю исключаются.",
-                    size=12,
-                    color=ft.Colors.GREY,
-                ),
-                ft.Row([start_btn], alignment=ft.MainAxisAlignment.START),
-            ],
-            expand=True,
-            scroll=ft.ScrollMode.AUTO,
-        ),
-        padding=20,
-    )
-
-
-def build_messages_view(page):
-    cfg = load_config() or {}
-    last_selection = [None]
+    dm_btn = ft.Button("Запустить рассылку в личку", icon=ft.Icons.CHAT, on_click=on_start_dm)
 
     msg_field = ft.TextField(
         label="Текст рассылки",
@@ -1956,35 +2030,6 @@ def build_messages_view(page):
         page.show_dialog(dlg)
         page.update()
 
-    def _build_preview_section(mf, pm_dd):
-        preview_text = ft.Text("", size=12, color=ft.Colors.GREY_700, selectable=True)
-        preview_container = ft.Container(
-            content=ft.Column(
-                [
-                    ft.Text("Предпросмотр", size=14, weight=ft.FontWeight.W_500),
-                    ft.Container(
-                        content=preview_text,
-                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
-                        padding=12,
-                        border_radius=8,
-                    ),
-                ],
-                tight=True,
-            ),
-        )
-
-        def update_preview(*_):
-            text = mf.value or ""
-            sample = substitute_variables(text, "Пример чата", "+7 900 123-45-67", 150)
-            preview_text.value = sample
-            if preview_text.page:
-                preview_text.update()
-
-        mf.on_change = lambda e: update_preview()
-        pm_dd.on_change = lambda e: update_preview()
-        preview_text.value = substitute_variables(mf.value or "", "Пример чата", "+7 900 123-45-67", 150)
-        return preview_container
-
     def _build_broadcast_settings_section(p):
         cfg = load_config() or {}
         delay_field = ft.TextField(
@@ -1993,64 +2038,13 @@ def build_messages_view(page):
             width=180,
             keyboard_type=ft.KeyboardType.NUMBER,
         )
-        test_mode_dd = ft.Dropdown(
-            label="Тестовый режим",
+        messages_per_chat_field = ft.TextField(
+            label="Количество сообщений в один чат с одного аккаунта",
+            value=str(cfg.get("messages_per_chat_per_account", 1)),
             width=220,
-            value=cfg.get("test_mode") or "off",
-            options=[
-                ft.dropdown.Option("off", "Выключен"),
-                ft.dropdown.Option("self", "Только себе (Избранное)"),
-                ft.dropdown.Option("single_chat", "Один чат"),
-            ],
-        )
-        test_chat_field = ft.TextField(
-            label="Название чата (подстрока)",
-            value=cfg.get("test_chat_name", ""),
-            width=260,
-            hint_text="Для режима «Один чат»",
-            visible=(cfg.get("test_mode") == "single_chat"),
-        )
-
-        chat_f = cfg.get("chat_filter") or {}
-        inc_val = chat_f.get("include_by_name")
-        include_field = ft.TextField(
-            label="Включить чаты",
-            value=", ".join(inc_val) if isinstance(inc_val, list) else (inc_val or ""),
-            hint_text="Названия или подстроки через запятую (пусто = все)",
-        )
-
-        exc_val = chat_f.get("exclude_by_name")
-        exclude_field = ft.TextField(
-            label="Исключить чаты",
-            value=", ".join(exc_val) if isinstance(exc_val, list) else (exc_val or ""),
-            hint_text="Названия или подстроки через запятую",
-        )
-
-        min_p_field = ft.TextField(
-            hint_text="Мин. участников",
-            value=str(chat_f.get("min_participants") or ""),
-            width=120,
             keyboard_type=ft.KeyboardType.NUMBER,
+            hint_text="1 = одно сообщение в каждый чат",
         )
-        max_p_field = ft.TextField(
-            hint_text="Макс. участников",
-            value=str(chat_f.get("max_participants") or ""),
-            width=120,
-            keyboard_type=ft.KeyboardType.NUMBER,
-        )
-
-        blacklist_field = ft.TextField(
-            label="Чёрный список",
-            value=", ".join(cfg.get("blacklist") or []),
-            hint_text="Названия чатов через запятую",
-        )
-        whitelist_field = ft.TextField(
-            label="Белый список",
-            value=", ".join(cfg.get("whitelist") or []),
-            hint_text="Названия чатов через запятую (если не пусто — только эти)",
-        )
-
-        use_vars_cb = ft.Checkbox(label="Подставлять переменные {имя}, {номер}", value=cfg.get("use_variables", True))
         max_retries_field = ft.TextField(
             label="Повторов при ошибке",
             value=str(cfg.get("max_retries", 3)),
@@ -2059,26 +2053,17 @@ def build_messages_view(page):
             hint_text="1–5",
         )
 
-        def _parse_list(s):
-            return [x.strip() for x in str(s or "").split(",") if x.strip()]
-
         def save_broadcast_settings(ev):
             c = load_config() or {}
             try:
                 c["message_delay_sec"] = max(0, float(delay_field.value or 2))
             except ValueError:
                 c["message_delay_sec"] = 2
-            c["test_mode"] = test_mode_dd.value or "off"
-            c["test_chat_name"] = (test_chat_field.value or "").strip()
-            c["chat_filter"] = {
-                "include_by_name": _parse_list(include_field.value),
-                "exclude_by_name": _parse_list(exclude_field.value),
-                "min_participants": int(min_p_field.value or 0) or 0,
-                "max_participants": int(max_p_field.value or 0) or 0,
-            }
-            c["blacklist"] = _parse_list(blacklist_field.value)
-            c["whitelist"] = _parse_list(whitelist_field.value)
-            c["use_variables"] = use_vars_cb.value
+            try:
+                n = max(1, int(messages_per_chat_field.value or 1))
+                c["messages_per_chat_per_account"] = n
+            except ValueError:
+                c["messages_per_chat_per_account"] = 1
             try:
                 r = int(max_retries_field.value or 3)
                 c["max_retries"] = max(1, min(5, r))
@@ -2088,38 +2073,12 @@ def build_messages_view(page):
             show_notify(p, "Настройки рассылки сохранены")
             p.update()
 
-        def on_test_mode_change(e):
-            test_chat_field.visible = test_mode_dd.value == "single_chat"
-            p.update()
-
-        test_mode_dd.on_change = on_test_mode_change
-
-        participants_row = ft.Row(
-            [
-                ft.Text("Участников:", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                min_p_field,
-                ft.Text("—", size=14, color=ft.Colors.ON_SURFACE_VARIANT),
-                max_p_field,
-            ],
-            spacing=8,
-            alignment=ft.MainAxisAlignment.START,
-        )
-
         return ft.Container(
             content=ft.Column(
                 [
                     ft.Text("Настройки рассылки", size=16, weight=ft.FontWeight.W_600),
                     ft.Divider(height=1),
-                    ft.Row([delay_field, test_mode_dd, test_chat_field], spacing=16, wrap=True),
-                    ft.Text("Фильтр по названию", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                    include_field,
-                    exclude_field,
-                    participants_row,
-                    ft.Text("Списки чатов", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                    blacklist_field,
-                    whitelist_field,
-                    ft.Divider(height=1),
-                    ft.Row([use_vars_cb, max_retries_field], spacing=16),
+                    ft.Row([delay_field, messages_per_chat_field, max_retries_field], spacing=16, wrap=True),
                     ft.Row(
                         [ft.Button("Сохранить настройки", icon=ft.Icons.SETTINGS, on_click=save_broadcast_settings)],
                         alignment=ft.MainAxisAlignment.START,
@@ -2132,7 +2091,7 @@ def build_messages_view(page):
             border_radius=12,
         )
 
-    return ft.Container(
+    c = ft.Container(
         content=ft.Column(
             [
                 ft.Text("Сообщения", size=24, weight=ft.FontWeight.BOLD),
@@ -2159,9 +2118,15 @@ def build_messages_view(page):
                     ],
                     spacing=8,
                 ),
-                ft.Container(height=8),
-                _build_preview_section(msg_field, parse_mode_dd),
-                ft.Container(height=8),
+                ft.Container(height=12),
+                ft.Text("Рассылка в личку", size=16, weight=ft.FontWeight.W_600),
+                ft.Text(
+                    "Отправить сообщение в личку каждому участнику всех чатов из базы (раздел «Чаты»). Текст и вложения — из этого раздела. Дубликаты по пользователю исключаются.",
+                    size=12,
+                    color=ft.Colors.GREY,
+                ),
+                ft.Row([dm_btn], alignment=ft.MainAxisAlignment.START),
+                ft.Container(height=12),
                 _build_broadcast_settings_section(page),
             ],
             expand=True,
@@ -2169,14 +2134,17 @@ def build_messages_view(page):
         ),
         padding=20,
     )
+    return (c, None)
 
 
 def build_schedule_view(page, run_broadcast_callback, schedule_status_ref):
     cfg = load_config() or {}
+    today = datetime.now().strftime("%Y-%m-%d")
+
     enabled_cb = ft.Checkbox(label="Включить отложенную рассылку", value=cfg.get("schedule_enabled", False))
     type_dd = ft.Dropdown(
-        label="Тип",
-        width=200,
+        label="Тип расписания",
+        width=280,
         value=cfg.get("schedule_type") or "once",
         options=[
             ft.dropdown.Option("once", "Один раз в указанное время"),
@@ -2184,24 +2152,59 @@ def build_schedule_view(page, run_broadcast_callback, schedule_status_ref):
             ft.dropdown.Option("daily", "Ежедневно в указанное время"),
         ],
     )
-    today = datetime.now().strftime("%Y-%m-%d")
-    once_date = ft.TextField(label="Дата (ГГГГ-ММ-ДД)", value=cfg.get("schedule_once_date") or today, width=160, hint_text="2025-03-10")
-    once_time = ft.TextField(label="Время (ЧЧ:ММ)", value=cfg.get("schedule_once_time") or "09:00", width=100)
-    interval_min = ft.TextField(label="Интервал (минут)", value=str(cfg.get("schedule_interval_minutes") or 60), width=120, keyboard_type=ft.KeyboardType.NUMBER)
-    daily_time = ft.TextField(label="Время (ЧЧ:ММ)", value=cfg.get("schedule_daily_time") or "09:00", width=100)
+
+    once_date = ft.TextField(label="Дата (ГГГГ-ММ-ДД)", value=cfg.get("schedule_once_date") or today, width=180, hint_text="2025-03-10")
+    once_time = ft.TextField(label="Время (ЧЧ:ММ)", value=cfg.get("schedule_once_time") or "09:00", width=120)
+    interval_min = ft.TextField(label="Интервал (минут)", value=str(cfg.get("schedule_interval_minutes") or 60), width=140, keyboard_type=ft.KeyboardType.NUMBER)
+    daily_time = ft.TextField(label="Время (ЧЧ:ММ)", value=cfg.get("schedule_daily_time") or "09:00", width=120)
+
+    params_container = ft.Container(content=ft.Row([once_date, once_time], spacing=12))
+
     next_run_text = ft.Text("", size=12, color=ft.Colors.GREY)
     status_text = ft.Text("", size=12, color=ft.Colors.PRIMARY)
 
-    once_row = ft.Row([once_date, once_time], spacing=12)
-    interval_row = ft.Row([interval_min], spacing=12)
-    daily_row = ft.Row([daily_time], spacing=12)
-
-    def update_visibility(e=None):
-        t = type_dd.value or "once"
-        once_row.visible = t == "once"
-        interval_row.visible = t == "interval"
-        daily_row.visible = t == "daily"
+    def _apply_params_block(t: str):
+        t = t or "once"
+        if t == "once":
+            params_container.content = ft.Row(
+                [
+                    ft.Text("Дата и время:", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    once_date,
+                    once_time,
+                ],
+                spacing=12,
+                wrap=True,
+                alignment=ft.MainAxisAlignment.START,
+            )
+        elif t == "interval":
+            params_container.content = ft.Row(
+                [
+                    ft.Text("Каждые N минут:", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    interval_min,
+                ],
+                spacing=12,
+                alignment=ft.MainAxisAlignment.START,
+            )
+        else:
+            params_container.content = ft.Row(
+                [
+                    ft.Text("Время запуска:", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                    daily_time,
+                ],
+                spacing=12,
+                alignment=ft.MainAxisAlignment.START,
+            )
         page.update()
+
+    def update_params_block(e=None):
+        def do_apply():
+            v = type_dd.value or "once"
+            _apply_params_block(v)
+
+        if e is not None:
+            threading.Timer(0.05, lambda: _run_on_page(page, do_apply)).start()
+        else:
+            do_apply()
 
     def refresh_next():
         c = load_config() or {}
@@ -2211,6 +2214,7 @@ def build_schedule_view(page, run_broadcast_callback, schedule_status_ref):
         once_time.value = c.get("schedule_once_time") or "09:00"
         interval_min.value = str(c.get("schedule_interval_minutes") or 60)
         daily_time.value = c.get("schedule_daily_time") or "09:00"
+        _apply_params_block(c.get("schedule_type") or "once")
         next_run = get_next_run(c)
         if next_run:
             next_run_text.value = f"Следующий запуск: {next_run.strftime('%Y-%m-%d %H:%M')}"
@@ -2235,30 +2239,40 @@ def build_schedule_view(page, run_broadcast_callback, schedule_status_ref):
             schedule_status_ref[0] = c.get("schedule_enabled", False)
         page.update()
 
-    type_dd.on_change = update_visibility
-    update_visibility()
+    type_dd.on_change = update_params_block
+    update_params_block()
     refresh_next()
 
-    return ft.Container(
+    c = ft.Container(
         content=ft.Column(
             [
                 ft.Text("Отложенная рассылка", size=24, weight=ft.FontWeight.BOLD),
-                ft.Divider(),
+                ft.Divider(height=2),
+                ft.Container(height=8),
                 ft.Text("Настройте время рассылки. Рассылка запустится автоматически в указанное время.", size=12, color=ft.Colors.GREY),
+                ft.Container(height=20),
                 enabled_cb,
+                ft.Container(height=16),
+                ft.Text("Тип", size=14, weight=ft.FontWeight.W_500),
                 type_dd,
-                once_row,
-                interval_row,
-                daily_row,
+                ft.Container(height=12),
+                ft.Text("Параметры", size=14, weight=ft.FontWeight.W_500),
+                params_container,
+                ft.Container(height=20),
+                ft.Text("Статус", size=14, weight=ft.FontWeight.W_500),
                 next_run_text,
+                ft.Container(height=20),
                 ft.Row([ft.Button("Сохранить расписание", icon=ft.Icons.SCHEDULE, on_click=save_schedule)], alignment=ft.MainAxisAlignment.START),
+                ft.Container(height=8),
                 status_text,
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
+            spacing=0,
         ),
-        padding=20,
+        padding=24,
     )
+    return (c, None)
 
 
 def save_message(text, parse_mode=None, attachments=None, page=None):
@@ -2395,6 +2409,8 @@ def main(page: ft.Page):
 
     page.theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
     page.dark_theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
+    page.padding = 0
+    page.spacing = 0
 
     def on_login(pwd, remember=False):
         if verify(pwd):
@@ -2440,30 +2456,37 @@ def main(page: ft.Page):
 
         schedule_enabled_ref = [load_config().get("schedule_enabled", False)]
 
+        view_cache = {}
+        view_refresh = {}
+
         def build_content(idx):
             if idx == 0:
                 return build_home_view(p, on_nav)
             if idx == 1:
                 return build_accounts_view(p)
             if idx == 2:
-                return build_stats_view(p)
-            if idx == 3:
                 return build_notifications_view(p)
-            if idx == 4:
+            if idx == 3:
                 return build_profile_view(p)
+            if idx == 4:
+                return build_messages_view(p, status_text, pb, counter_text)
             if idx == 5:
-                return build_messages_view(p)
-            if idx == 6:
                 return build_schedule_view(p, lambda: run_broadcast_thread(p, pb, status_text, counter_text), schedule_enabled_ref)
+            if idx == 6:
+                return build_chats_view(p, on_refresh=lambda: on_nav(6))
             if idx == 7:
-                return build_dm_view(p, status_text, pb, counter_text)
-            if idx == 8:
-                return build_chats_view(p, on_refresh=lambda: on_nav(8))
+                return build_exports_view(p)
             return build_home_view(p, on_nav)
 
         def on_nav(idx):
             nav_index[0] = idx
-            content_area.content = build_content(idx)
+            if idx not in view_cache:
+                content, refresh_fn = build_content(idx)
+                view_cache[idx] = content
+                view_refresh[idx] = refresh_fn
+            content_area.content = view_cache[idx]
+            if view_refresh.get(idx):
+                view_refresh[idx]()
             p.update()
 
         status_text = ft.Text("", size=12)
@@ -2498,7 +2521,7 @@ def main(page: ft.Page):
 
         start_btn = ft.Button("Запустить рассылку", icon=ft.Icons.SEND, on_click=on_start_click)
 
-        content_area.content = build_content(0)
+        on_nav(0)
         sidebar = build_sidebar(on_nav, 0)
 
         schedule_stop = threading.Event()
@@ -2511,13 +2534,16 @@ def main(page: ft.Page):
         p.add(
             ft.Row(
                 [
-                    sidebar,
+                    ft.Container(content=sidebar, padding=ft.padding.only(left=12, top=12, bottom=12)),
                     ft.VerticalDivider(width=1),
                     ft.Column(
                         [
                             ft.Row([content_area], expand=True),
-                            ft.Divider(),
-                            ft.Row([start_btn, pb, counter_text, status_text], alignment=ft.MainAxisAlignment.START, wrap=True),
+                            ft.Divider(height=2),
+                            ft.Container(
+                                content=ft.Row([start_btn, pb, counter_text, status_text], alignment=ft.MainAxisAlignment.START, wrap=True, spacing=16),
+                                padding=16,
+                            ),
                         ],
                         expand=True,
                     ),
