@@ -69,7 +69,9 @@ from errors import ACCORDION_CATEGORIES, get_level_style
 from schedule import get_next_run, mark_run, run_scheduler
 from tray import run_tray
 from tdata_import import add_accounts_to_config, import_tdata_folder, open_tdata_folder
+from updater import check_for_updates
 from validate_accounts import validate_all_accounts
+from version import APP_VERSION
 WIDTH = 1100
 HEIGHT = 700
 RESPONSE_QUEUE = queue.Queue()
@@ -1199,6 +1201,39 @@ def build_chats_view(page, on_refresh=None):
     )
 
 
+def _do_check_updates(e, page, update_url_field):
+    url = (update_url_field.value or "").strip() if update_url_field else ""
+    if url:
+        c = load_config() or {}
+        c["update_check_url"] = url
+        save_config(c)
+    try:
+        info = check_for_updates(url or (load_config() or {}).get("update_check_url", ""))
+        if info:
+            def open_url(ev):
+                import webbrowser
+                webbrowser.open(info.url)
+                ev.page.pop_dialog()
+                ev.page.update()
+            dlg = ft.AlertDialog(
+                title=ft.Text("Доступно обновление"),
+                content=ft.Column([
+                    ft.Text(f"Версия {info.version} доступна для скачивания."),
+                    ft.Container(content=ft.Text(info.notes[:300] + "..." if len(info.notes) > 300 else info.notes, size=12, color=ft.Colors.GREY)) if info.notes else ft.Container(),
+                ], tight=True),
+                actions=[
+                    ft.TextButton("Закрыть", on_click=lambda ev: (ev.page.pop_dialog(), ev.page.update())),
+                    ft.Button("Скачать", icon=ft.Icons.DOWNLOAD, on_click=open_url),
+                ],
+            )
+            page.show_dialog(dlg)
+        else:
+            show_notify(page, "У вас последняя версия" if url or (load_config() or {}).get("update_check_url") else "Укажите URL проверки обновлений")
+    except Exception as ex:
+        show_notify(page, f"Ошибка: {ex}", is_error=True)
+    page.update()
+
+
 def build_profile_view(page):
     import json as _json
     cfg = load_config() or {}
@@ -1368,6 +1403,18 @@ def build_profile_view(page):
                 ft.Divider(),
                 ft.Text("Безопасность", size=16, weight=ft.FontWeight.W_600),
                 ft.Button("Сброс пароля", icon=ft.Icons.LOCK_RESET, on_click=show_reset_password_dialog),
+                ft.Divider(),
+                ft.Text("Обновления", size=16, weight=ft.FontWeight.W_600),
+                ft.Text(f"Версия: {APP_VERSION}", size=12, color=ft.Colors.GREY),
+                update_url_field := ft.TextField(
+                    label="URL проверки обновлений",
+                    value=cfg.get("update_check_url", ""),
+                    width=450,
+                    hint_text="https://api.github.com/repos/owner/repo/releases/latest или свой JSON",
+                ),
+                ft.Row([
+                    ft.Button("Проверить обновления", icon=ft.Icons.UPDATE, on_click=lambda e: _do_check_updates(e, page, update_url_field)),
+                ], spacing=8),
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
